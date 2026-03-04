@@ -104,6 +104,25 @@ def fallback_kr_universe() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def kr_universe_from_seed(limit: int = 3000) -> pd.DataFrame:
+    seed = get_sector_seed_map()
+    if seed is None or seed.empty:
+        return pd.DataFrame()
+    kr = seed[seed["market"].astype(str).str.upper().eq("KR")].copy()
+    if kr.empty:
+        return pd.DataFrame()
+    kr["ticker"] = kr["ticker"].astype(str).str.zfill(6)
+    kr["name"] = kr.get("name", kr.get("sector", "")).fillna("").astype(str)
+    kr["yf_ticker"] = kr["ticker"] + ".KS"
+    kr["market"] = "KR"
+    kr["currency"] = "KRW"
+    kr["_source"] = "seed_kr"
+    out = kr[["market", "ticker", "yf_ticker", "name", "currency", "_source"]].drop_duplicates(subset=["ticker"])
+    if limit > 0:
+        out = out.head(int(limit))
+    return out.reset_index(drop=True)
+
+
 def save_universe_cache(df: pd.DataFrame, path: Path) -> None:
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -194,7 +213,20 @@ def test_krx_api_key(key: str) -> Tuple[bool, str]:
 
 @st.cache_data(ttl=86400)
 def get_sector_seed_map() -> pd.DataFrame:
-    # One-day sector seed cache from FDR listings (cheap and stable).
+    # One-day sector seed cache from file/FDR listings (cheap and stable).
+    try:
+        if SECTOR_SEED_PATH.exists():
+            cached = pd.read_csv(SECTOR_SEED_PATH)
+            need = {"market", "ticker", "sector"}
+            if need.issubset(set(cached.columns)) and not cached.empty:
+                cached["market"] = cached["market"].astype(str).str.upper().str.strip()
+                cached["ticker"] = cached["ticker"].astype(str).str.upper().str.strip()
+                if "ticker_norm" not in cached.columns:
+                    cached["ticker_norm"] = cached.apply(lambda r: _norm_ticker(r["market"], r["ticker"]), axis=1)
+                return cached
+    except Exception:
+        pass
+
     if fdr is None:
         return pd.DataFrame(columns=["market", "ticker", "sector", "updated_at"])
     rows: List[Dict] = []
@@ -424,6 +456,9 @@ def check_krx_connection() -> Tuple[bool, str]:
         total = len(k1) + len(k2)
         if total > 0:
             return True, f"KRX 로딩 OK (KOSPI+KOSDAQ {total:,}개)"
+        seed_df = kr_universe_from_seed(limit=3000)
+        if not seed_df.empty:
+            return True, f"KRX 직접 티커는 비었지만 seed 복구 가능 ({len(seed_df):,}개)"
         return False, "KRX 응답은 있으나 티커가 비어 있습니다."
     except Exception as e:
         return False, f"KRX 체크 실패: {e}"
@@ -484,6 +519,10 @@ def get_kr_universe() -> pd.DataFrame:
         else:
             cached["_source"] = "cache_kr"
         return cached
+    seeded = kr_universe_from_seed(limit=3000)
+    if not seeded.empty:
+        save_universe_cache(seeded, KR_CACHE_PATH)
+        return seeded
     # Last fallback: small KR sample so KR-only mode remains usable.
     return fallback_kr_universe()
 
