@@ -2,6 +2,7 @@ import concurrent.futures
 from datetime import datetime, timedelta
 import os
 from pathlib import Path
+import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -1196,7 +1197,104 @@ def _extract_history_from_download(data: pd.DataFrame, ticker: str) -> pd.DataFr
         return pd.DataFrame()
 
 
+def _download_batch_with_deadline(
+    tickers: List[str], history_period: str, current_threads: int, timeout_sec: int
+) -> Tuple[pd.DataFrame, bool]:
+    result: Dict[str, object] = {"data": pd.DataFrame(), "done": False}
+
+    def _worker() -> None:
+        try:
+            data = yf.download(
+                tickers=tickers,
+                period=history_period,
+                interval="1d",
+                auto_adjust=False,
+                actions=True,
+                group_by="ticker",
+                threads=current_threads,
+                progress=False,
+                timeout=10,
+            )
+            result["data"] = data if data is not None else pd.DataFrame()
+        except Exception:
+            result["data"] = pd.DataFrame()
+        finally:
+            result["done"] = True
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(max(1, int(timeout_sec)))
+    if not bool(result.get("done")):
+        return pd.DataFrame(), True
+    data = result.get("data")
+    if isinstance(data, pd.DataFrame):
+        return data, False
+    return pd.DataFrame(), False
+
+
+def _period_to_days(period: str) -> int:
+    p = str(period).strip().lower()
+    if p.endswith("y"):
+        try:
+            return int(p[:-1]) * 365
+        except Exception:
+            return 5 * 365
+    if p.endswith("mo"):
+        try:
+            return int(p[:-2]) * 30
+        except Exception:
+            return 365
+    if p.endswith("d"):
+        try:
+            return int(p[:-1])
+        except Exception:
+            return 365
+    return 5 * 365
+
+
+def _fetch_kr_history_pykrx(ticker: str, history_period: str) -> pd.DataFrame:
+    tk = "".join(ch for ch in str(ticker) if ch.isdigit()).zfill(6)
+    if tk == "000000":
+        return pd.DataFrame()
+    end_dt = datetime.now().date()
+    start_dt = end_dt - timedelta(days=_period_to_days(history_period) + 35)
+    try:
+        ohlcv = pykrx_stock.get_market_ohlcv_by_date(
+            start_dt.strftime("%Y%m%d"),
+            end_dt.strftime("%Y%m%d"),
+            tk,
+        )
+    except Exception:
+        return pd.DataFrame()
+    if ohlcv is None or ohlcv.empty:
+        return pd.DataFrame()
+    out = ohlcv.copy()
+    rename_map = {
+        "종가": "Close",
+        "거래량": "Volume",
+        "시가": "Open",
+        "고가": "High",
+        "저가": "Low",
+        "거래대금": "Value",
+    }
+    out = out.rename(columns={k: v for k, v in rename_map.items() if k in out.columns})
+    if "Close" not in out.columns:
+        return pd.DataFrame()
+    if "Volume" not in out.columns:
+        out["Volume"] = pd.Series([0] * len(out), index=out.index, dtype=float)
+    if not isinstance(out.index, pd.DatetimeIndex):
+        try:
+            out.index = pd.to_datetime(out.index)
+        except Exception:
+            pass
+    return out.dropna(how="all")
+
+
 def _compute_metrics(item: Dict, fx: Optional[float], fetch_info: bool = True, history_period: str = "5y") -> Optional[Dict]:
+    if str(item.get("market", "")).upper() == "KR":
+        hist = _fetch_kr_history_pykrx(item.get("ticker", ""), history_period)
+        return _build_metrics_from_history(item, hist, fx, info={})
+
     tk = yf.Ticker(item["yf_ticker"])
     hist = pd.DataFrame()
     for i in range(3):
@@ -1578,6 +1676,8 @@ def _run_scan_batched(
     universe: pd.DataFrame, fx: Optional[float], workers: int, history_period: str = "2y"
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
     items = universe.to_dict(orient="records")
+    kr_items = [it for it in items if str(it.get("market", "")).upper() == "KR"]
+    non_kr_items = [it for it in items if str(it.get("market", "")).upper() != "KR"]
     rows: List[Dict] = []
     none_count = 0
     err_count = 0
@@ -1590,9 +1690,31 @@ def _run_scan_batched(
     batch_timeout_sec = 18
     done = 0
     bar = st.progress(0, text="스캔 계산 중(배치 모드)...")
+
+    # KR is fetched through pykrx per ticker to reduce yfinance dependency.
+    if kr_items:
+        kr_workers = max(2, min(int(workers), 10))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=kr_workers) as ex:
+            futures = [ex.submit(_compute_metrics, it, fx, False, history_period) for it in kr_items]
+            for idx, f in enumerate(concurrent.futures.as_completed(futures), start=1):
+                try:
+                    r = f.result()
+                    if r:
+                        rows.append(r)
+                    else:
+                        none_count += 1
+                except Exception:
+                    err_count += 1
+                done += 1
+                if idx % 20 == 0 or idx == len(futures):
+                    bar.progress(
+                        int(done * 100 / max(1, len(items))),
+                        text=f"스캔 계산 중(KR 모드)... {done}/{len(items)}",
+                    )
+
     i = 0
-    while i < len(items):
-        batch_items = items[i:i + current_batch]
+    while i < len(non_kr_items):
+        batch_items = non_kr_items[i:i + current_batch]
         tickers = [it["yf_ticker"] for it in batch_items if it.get("yf_ticker")]
         if not tickers:
             none_count += len(batch_items)
@@ -1603,17 +1725,15 @@ def _run_scan_batched(
         batch_started_at = time.time()
         for retry in range(2):
             try:
-                data = yf.download(
+                remain_sec = max(3, int(batch_timeout_sec - (time.time() - batch_started_at)))
+                data, timed_out = _download_batch_with_deadline(
                     tickers=tickers,
-                    period=history_period,
-                    interval="1d",
-                    auto_adjust=False,
-                    actions=True,
-                    group_by="ticker",
-                    threads=current_threads,
-                    progress=False,
-                    timeout=10,
+                    history_period=history_period,
+                    current_threads=current_threads,
+                    timeout_sec=remain_sec,
                 )
+                if timed_out:
+                    break
                 if data is not None and not data.empty:
                     break
             except Exception:
@@ -1622,16 +1742,13 @@ def _run_scan_batched(
                 break
             time.sleep(0.6 * (retry + 1))
         if data is None or data.empty:
-            err_count += len(batch_items)
-            done += len(batch_items)
-            bar.progress(int(done * 100 / max(1, len(items))), text=f"스캔 계산 중(배치 모드)... {done}/{len(items)}")
             current_batch = max(80, int(current_batch * 0.7))
             current_threads = max(2, current_threads - 1)
             adaptive_down_count += 1
             stalled_batches += 1
-            # If batch mode keeps stalling, switch to per-ticker history mode for remaining items.
-            if stalled_batches >= 3 and i + len(batch_items) < len(items):
-                remain = items[i + len(batch_items):]
+            # If batch mode keeps stalling, switch to per-ticker history mode for current+remaining items.
+            if stalled_batches >= 3 and i < len(non_kr_items):
+                remain = non_kr_items[i:]
                 if remain:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=current_threads) as ex:
                         futures = [ex.submit(_compute_metrics, it, fx, False, history_period) for it in remain]
@@ -1650,8 +1767,11 @@ def _run_scan_batched(
                                     int(done * 100 / max(1, len(items))),
                                     text=f"스캔 계산 중(폴백 모드)... {done}/{len(items)}",
                                 )
-                i = len(items)
+                i = len(non_kr_items)
                 break
+            err_count += len(batch_items)
+            done += len(batch_items)
+            bar.progress(int(done * 100 / max(1, len(items))), text=f"스캔 계산 중(배치 모드)... {done}/{len(items)}")
             time.sleep(0.8)
             i += len(batch_items)
             continue
@@ -2471,7 +2591,7 @@ def main() -> None:
             },
             {
                 "구분": "시세 API",
-                "현재 소스": "yfinance",
+                "현재 소스": "KR: pykrx / US: yfinance",
                 "현재 종목수": "-",
                 "캐시 종목수": "-",
                 "캐시 갱신시각": "-",
