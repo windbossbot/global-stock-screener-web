@@ -72,6 +72,13 @@ KR_CACHE_PATH = CACHE_DIR / "kr_universe.csv"
 SECTOR_CACHE_PATH = CACHE_DIR / "sector_cache.csv"
 SECTOR_SEED_PATH = CACHE_DIR / "sector_seed.csv"
 KRX_KEY_PATH = CACHE_DIR / "krx_api_key.txt"
+KR_SEED_PATH = CACHE_DIR / "kr_universe_seed.csv"
+KR_SECTOR_MASTER_PATH = CACHE_DIR / "kr_sector_master.csv"
+KRX_OPENAPI_ENDPOINTS = [
+    ("KOSPI", "https://data.krx.co.kr/svc/apis/sto/stk_bydd_trd"),
+    ("KOSDAQ", "https://data.krx.co.kr/svc/apis/sto/ksq_bydd_trd"),
+    ("KONEX", "https://data.krx.co.kr/svc/apis/sto/knx_bydd_trd"),
+]
 try:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     yf.set_tz_cache_location(str(CACHE_DIR / "yf_tz_cache"))
@@ -179,6 +186,71 @@ def load_krx_api_key() -> str:
     return ""
 
 
+def load_kr_seed_universe() -> pd.DataFrame:
+    try:
+        if not KR_SEED_PATH.exists():
+            return pd.DataFrame()
+        df = pd.read_csv(KR_SEED_PATH, dtype=str)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        code_col = None
+        for c in ["ticker", "종목코드", "Code", "code", "ISU_SRT_CD"]:
+            if c in df.columns:
+                code_col = c
+                break
+        if not code_col:
+            return pd.DataFrame()
+        name_col = None
+        for c in ["name", "회사명", "Name", "ISU_ABBRV"]:
+            if c in df.columns:
+                name_col = c
+                break
+        market_col = None
+        for c in ["market", "시장", "Market", "MKT_NM"]:
+            if c in df.columns:
+                market_col = c
+                break
+        rows: List[Dict] = []
+        for _, r in df.iterrows():
+            tk = str(r.get(code_col, "")).strip()
+            tk = "".join(ch for ch in tk if ch.isdigit()).zfill(6)
+            if tk == "000000":
+                continue
+            mkt_txt = str(r.get(market_col, "")).upper() if market_col else ""
+            sfx = ".KQ" if ("KOSDAQ" in mkt_txt or "KONEX" in mkt_txt or "KSQ" in mkt_txt or "KNX" in mkt_txt) else ".KS"
+            nm = str(r.get(name_col, "")).strip() if name_col else ""
+            rows.append(
+                {
+                    "market": "KR",
+                    "ticker": tk,
+                    "yf_ticker": f"{tk}{sfx}",
+                    "name": nm,
+                    "currency": "KRW",
+                    "_source": "seed_csv_kr",
+                }
+            )
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame(rows).drop_duplicates(subset=["ticker"]).reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+def save_kr_seed_universe(uploaded_file) -> Tuple[bool, str]:
+    try:
+        df = pd.read_csv(uploaded_file, dtype=str)
+        if df is None or df.empty:
+            return False, "CSV가 비어 있습니다."
+        code_exists = any(c in df.columns for c in ["ticker", "종목코드", "Code", "code", "ISU_SRT_CD"])
+        if not code_exists:
+            return False, "필수 컬럼(종목코드/ticker/Code)이 없습니다."
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        df.to_csv(KR_SEED_PATH, index=False, encoding="utf-8-sig")
+        return True, f"KR CSV 저장 완료 ({len(df):,}행)"
+    except Exception as e:
+        return False, f"CSV 저장 실패: {e}"
+
+
 def save_krx_api_key(key: str) -> bool:
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -201,14 +273,364 @@ def test_krx_api_key(key: str) -> Tuple[bool, str]:
     k = (key or "").strip()
     if len(k) < 10:
         return False, "키 길이가 너무 짧습니다. 발급 키를 다시 확인하세요."
-    # Connectivity smoke test (KRX endpoint reachability + key format check).
+    base = datetime.now()
+    for d in range(0, 7):
+        bas_dd = (base - timedelta(days=d)).strftime("%Y%m%d")
+        ok_any = False
+        for market_name, url in KRX_OPENAPI_ENDPOINTS:
+            try:
+                r = requests.get(
+                    url,
+                    headers={"AUTH_KEY": k, "User-Agent": "Mozilla/5.0"},
+                    params={"basDd": bas_dd},
+                    timeout=5,
+                )
+                if r.status_code == 200:
+                    js = r.json()
+                    rows = js.get("OutBlock_1") or js.get("OutBlock1") or js.get("output")
+                    if isinstance(rows, list) and len(rows) > 0:
+                        return True, f"실데이터 확인 OK ({market_name}, {bas_dd}, {len(rows):,}행)"
+                    ok_any = True
+            except Exception:
+                continue
+        if ok_any:
+            # endpoint is alive but this day can be non-trading day
+            continue
+    return False, "키 테스트 실패: 실데이터 응답 없음 (권한/서비스신청/키값/일자 확인 필요)"
+
+
+def _krx_openapi_list_by_date(api_key: str, bas_dd: str) -> pd.DataFrame:
+    headers = {"AUTH_KEY": api_key.strip(), "User-Agent": "Mozilla/5.0"}
+    params = {"basDd": bas_dd}
+    frames: List[pd.DataFrame] = []
+    for market_name, url in KRX_OPENAPI_ENDPOINTS:
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=12)
+            if r.status_code != 200:
+                continue
+            js = r.json()
+            rows = js.get("OutBlock_1") or js.get("OutBlock1") or js.get("output") or []
+            if not rows:
+                continue
+            df = pd.json_normalize(rows)
+            if df is not None and not df.empty:
+                df["_krx_market_hint"] = market_name
+                frames.append(df)
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def get_kr_universe_from_openapi(api_key: str) -> pd.DataFrame:
+    key = (api_key or "").strip()
+    if len(key) < 10:
+        return pd.DataFrame()
+    base = datetime.now()
+    raw = pd.DataFrame()
+    used_date = ""
+    for d in range(0, 10):
+        bas_dd = (base - timedelta(days=d)).strftime("%Y%m%d")
+        raw = _krx_openapi_list_by_date(key, bas_dd)
+        if not raw.empty:
+            used_date = bas_dd
+            break
+    if raw.empty:
+        return pd.DataFrame()
+
+    # Flexible column mapping (KRX schema names can vary by service version).
+    col_ticker = None
+    for c in ["ISU_SRT_CD", "ISU_CD", "isuSrtCd", "isuCd"]:
+        if c in raw.columns:
+            col_ticker = c
+            break
+    col_name = None
+    for c in ["ISU_ABBRV", "ISU_NM", "isuAbbrv", "isuNm"]:
+        if c in raw.columns:
+            col_name = c
+            break
+    col_market = None
+    for c in ["MKT_NM", "MKT_ID", "mktNm", "mktId"]:
+        if c in raw.columns:
+            col_market = c
+            break
+    if not col_ticker:
+        return pd.DataFrame()
+
+    rows: List[Dict] = []
+    for _, r in raw.iterrows():
+        tk = str(r.get(col_ticker, "")).strip().upper()
+        if not tk:
+            continue
+        tk = "".join(ch for ch in tk if ch.isdigit()).zfill(6)
+        if tk == "000000":
+            continue
+        mkt_txt = str(r.get(col_market, "")).upper()
+        if not mkt_txt:
+            mkt_txt = str(r.get("_krx_market_hint", "")).upper()
+        if "KOSDAQ" in mkt_txt or "KSQ" in mkt_txt:
+            sfx = ".KQ"
+        elif "KONEX" in mkt_txt or "KNX" in mkt_txt:
+            sfx = ".KQ"
+        else:
+            sfx = ".KS"
+        nm = str(r.get(col_name, "")).strip()
+        rows.append({
+            "market": "KR",
+            "ticker": tk,
+            "yf_ticker": f"{tk}{sfx}",
+            "name": nm,
+            "currency": "KRW",
+            "_source": f"krx_openapi_{used_date}",
+        })
+    return pd.DataFrame(rows).drop_duplicates(subset=["ticker"]).reset_index(drop=True)
+
+
+def get_kr_universe_from_krx_finder() -> pd.DataFrame:
+    endpoints = [
+        "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd",
+        "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd",
+    ]
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd",
+    }
+    payload = {"bld": "dbms/comm/finder/finder_stkisu"}
+    for url in endpoints:
+        try:
+            r = requests.post(url, data=payload, headers=headers, timeout=12)
+            if r.status_code != 200:
+                continue
+            js = r.json()
+            rows = js.get("block1") or js.get("Block1") or []
+            if not isinstance(rows, list) or len(rows) == 0:
+                continue
+            out_rows: List[Dict] = []
+            for it in rows:
+                tk = str(it.get("short_code", "")).strip()
+                tk = "".join(ch for ch in tk if ch.isdigit()).zfill(6)
+                if tk == "000000":
+                    continue
+                mkt_code = str(it.get("marketCode", "")).upper().strip()
+                mkt_name = str(it.get("marketName", "")).upper().strip()
+                if mkt_code in {"KSQ", "KNX"} or ("KOSDAQ" in mkt_name) or ("KONEX" in mkt_name) or ("코스닥" in mkt_name) or ("코넥스" in mkt_name):
+                    sfx = ".KQ"
+                elif mkt_code in {"STK"} or ("KOSPI" in mkt_name) or ("유가증권" in mkt_name) or ("코스피" in mkt_name):
+                    sfx = ".KS"
+                else:
+                    continue
+                nm = str(it.get("codeName", "")).strip()
+                out_rows.append(
+                    {
+                        "market": "KR",
+                        "ticker": tk,
+                        "yf_ticker": f"{tk}{sfx}",
+                        "name": nm,
+                        "currency": "KRW",
+                        "_source": "krx_finder",
+                    }
+                )
+            if out_rows:
+                return pd.DataFrame(out_rows).drop_duplicates(subset=["ticker"]).reset_index(drop=True)
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=86400)
+def get_kr_sector_map_krx() -> pd.DataFrame:
+    # Pull KR sector labels directly from KRX market stats endpoint.
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd",
+    }
     try:
-        r = requests.get("https://openapi.krx.co.kr", timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code >= 200 and r.status_code < 500:
-            return True, f"키 형식/접속 확인 OK (포털 응답 {r.status_code})"
-        return False, f"포털 응답 비정상: {r.status_code}"
-    except Exception as e:
-        return False, f"테스트 실패: {e}"
+        date_meta = requests.get(
+            "http://data.krx.co.kr/comm/bldAttendant/executeForResourceBundle.cmd?baseName=krx.mdc.i18n.component&key=B128.bld",
+            headers=headers,
+            timeout=10,
+        )
+        date_meta.raise_for_status()
+        j = date_meta.json()
+        trd_dd = (((j or {}).get("result") or {}).get("output") or [{}])[0].get("max_work_dt")
+        if not trd_dd:
+            return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+    mkt_map = [("STK", ".KS"), ("KSQ", ".KQ"), ("KNX", ".KQ")]
+    rows: List[Dict] = []
+    for mkt_id, suffix in mkt_map:
+        payload = {
+            "bld": "dbms/MDC/STAT/standard/MDCSTAT01501",
+            "mktId": mkt_id,
+            "trdDd": trd_dd,
+            "share": "1",
+            "money": "1",
+            "csvxls_isNo": "false",
+        }
+        try:
+            r = requests.post(
+                "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd",
+                headers=headers,
+                data=payload,
+                timeout=12,
+            )
+            if r.status_code != 200:
+                continue
+            js = r.json()
+            block = js.get("OutBlock_1") or js.get("output") or []
+            if not isinstance(block, list) or len(block) == 0:
+                continue
+            for it in block:
+                tk = str(it.get("ISU_SRT_CD", "")).strip()
+                tk = "".join(ch for ch in tk if ch.isdigit()).zfill(6)
+                if tk == "000000":
+                    continue
+                sec = str(it.get("SECT_TP_NM", "") or it.get("IDX_IND_NM", "")).strip()
+                if not sec:
+                    continue
+                rows.append(
+                    {
+                        "market": "KR",
+                        "ticker": tk,
+                        "ticker_norm": tk,
+                        "sector": sec,
+                        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "yf_ticker": f"{tk}{suffix}",
+                    }
+                )
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows).drop_duplicates(subset=["market", "ticker_norm"], keep="last")
+    return out[["market", "ticker", "ticker_norm", "sector", "updated_at"]].reset_index(drop=True)
+
+
+@st.cache_data(ttl=86400)
+def get_kr_sector_map_master() -> pd.DataFrame:
+    # Stable KR sector fallback from FinanceData stock_master dataset.
+    url = "https://github.com/FinanceData/stock_master/raw/master/stock_master.csv.gz"
+    try:
+        df = pd.read_csv(url, dtype={"Symbol": str})
+        if df is None or df.empty:
+            return pd.DataFrame()
+        if "Symbol" not in df.columns:
+            return pd.DataFrame()
+        sec_col = "Sector" if "Sector" in df.columns else None
+        if not sec_col:
+            return pd.DataFrame()
+        if "Listing" in df.columns:
+            try:
+                listed = df["Listing"].astype(str).str.lower().isin(["true", "1", "y", "yes"])
+                df = df[listed]
+            except Exception:
+                pass
+        out = pd.DataFrame(
+            {
+                "market": "KR",
+                "ticker": df["Symbol"].astype(str).str.zfill(6),
+                "ticker_norm": df["Symbol"].astype(str).str.zfill(6),
+                "sector": df[sec_col].fillna("").astype(str).str.strip(),
+                "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        )
+        out = out[out["sector"] != ""]
+        out = out.drop_duplicates(subset=["market", "ticker_norm"], keep="last").reset_index(drop=True)
+        try:
+            out.to_csv(KR_SECTOR_MASTER_PATH, index=False, encoding="utf-8-sig")
+        except Exception:
+            pass
+        return out
+    except Exception:
+        pass
+    try:
+        if KR_SECTOR_MASTER_PATH.exists():
+            cached = pd.read_csv(KR_SECTOR_MASTER_PATH, dtype=str)
+            need = {"market", "ticker", "ticker_norm", "sector", "updated_at"}
+            if need.issubset(set(cached.columns)) and not cached.empty:
+                return cached
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=86400)
+def get_kr_sector_map_kind() -> pd.DataFrame:
+    urls = [
+        "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13",
+        "http://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13",
+    ]
+    for url in urls:
+        try:
+            tables = pd.read_html(url, dtype=str)
+            if not tables:
+                continue
+            df = tables[0].copy()
+            code_col = "종목코드" if "종목코드" in df.columns else None
+            sec_col = "업종" if "업종" in df.columns else None
+            if not code_col or not sec_col:
+                continue
+            out = pd.DataFrame(
+                {
+                    "market": "KR",
+                    "ticker": df[code_col].astype(str).str.zfill(6),
+                    "ticker_norm": df[code_col].astype(str).str.zfill(6),
+                    "sector": df[sec_col].fillna("").astype(str).str.strip(),
+                    "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+            )
+            out = out[out["sector"] != ""]
+            out = out.drop_duplicates(subset=["market", "ticker_norm"], keep="last").reset_index(drop=True)
+            if not out.empty:
+                return out
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=86400)
+def get_kr_universe_from_kind() -> pd.DataFrame:
+    urls = [
+        ("KOSPI", "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&marketType=stockMkt"),
+        ("KOSDAQ", "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&marketType=kosdaqMkt"),
+        ("KONEX", "https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&marketType=konexMkt"),
+    ]
+    rows: List[Dict] = []
+    for market_name, url in urls:
+        try:
+            tables = pd.read_html(url, dtype=str)
+            if not tables:
+                continue
+            df = tables[0].copy()
+            code_col = "종목코드" if "종목코드" in df.columns else None
+            name_col = "회사명" if "회사명" in df.columns else None
+            if not code_col:
+                continue
+            for _, r in df.iterrows():
+                tk = str(r.get(code_col, "")).strip()
+                tk = "".join(ch for ch in tk if ch.isdigit()).zfill(6)
+                if tk == "000000":
+                    continue
+                nm = str(r.get(name_col, "")).strip() if name_col else ""
+                sfx = ".KS" if market_name == "KOSPI" else ".KQ"
+                rows.append(
+                    {
+                        "market": "KR",
+                        "ticker": tk,
+                        "yf_ticker": f"{tk}{sfx}",
+                        "name": nm,
+                        "currency": "KRW",
+                        "_source": "kind_krx",
+                    }
+                )
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).drop_duplicates(subset=["ticker"]).reset_index(drop=True)
 
 
 @st.cache_data(ttl=86400)
@@ -377,39 +799,19 @@ def _nearest_krx_date() -> Optional[str]:
 
 
 def enrich_kr_fundamentals(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    # Fill KR market cap/dividend from pykrx in bulk.
+    # Fill KR dividend from pykrx in bulk (market cap excluded by policy).
     if df.empty:
-        return df, {"kr_fund_mcap_filled": 0.0, "kr_fund_div_filled": 0.0}
+        return df, {"kr_fund_div_filled": 0.0}
     out = df.copy()
     kr_mask = out["market"].astype(str).str.upper().eq("KR")
     if kr_mask.sum() == 0:
-        return out, {"kr_fund_mcap_filled": 0.0, "kr_fund_div_filled": 0.0}
+        return out, {"kr_fund_div_filled": 0.0}
 
-    before_mc = int(pd.to_numeric(out.loc[kr_mask, "market_cap_krw"], errors="coerce").notna().sum())
     before_div = int(pd.to_numeric(out.loc[kr_mask, "dividend_yield_pct"], errors="coerce").notna().sum())
 
     date = _nearest_krx_date()
     if not date:
-        return out, {"kr_fund_mcap_filled": 0.0, "kr_fund_div_filled": 0.0}
-
-    caps = []
-    for m in ["KOSPI", "KOSDAQ", "KONEX"]:
-        try:
-            cdf = pykrx_stock.get_market_cap_by_ticker(date, market=m)
-            if cdf is not None and not cdf.empty:
-                cdf = cdf.reset_index().rename(columns={cdf.columns[0]: "ticker"})
-                cdf["ticker"] = cdf["ticker"].astype(str).str.zfill(6)
-                # 시가총액 column name can vary by locale/package version.
-                cap_col = "시가총액" if "시가총액" in cdf.columns else None
-                if cap_col is None:
-                    for col in cdf.columns:
-                        if "시가총액" in str(col):
-                            cap_col = col
-                            break
-                if cap_col:
-                    caps.append(cdf[["ticker", cap_col]].rename(columns={cap_col: "mcap_krw_fill"}))
-        except Exception:
-            continue
+        return out, {"kr_fund_div_filled": 0.0}
     fund = pd.DataFrame()
     try:
         fdf = pykrx_stock.get_market_fundamental_by_ticker(date, market="ALL")
@@ -422,15 +824,8 @@ def enrich_kr_fundamentals(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, fl
     except Exception:
         pass
 
-    merged = out.loc[kr_mask, ["ticker", "market_cap_krw", "dividend_yield_pct"]].copy()
+    merged = out.loc[kr_mask, ["ticker", "dividend_yield_pct"]].copy()
     merged["ticker"] = merged["ticker"].astype(str).str.zfill(6)
-    if caps:
-        cap_df = pd.concat(caps, ignore_index=True).drop_duplicates(subset=["ticker"], keep="last")
-        merged = merged.merge(cap_df, on="ticker", how="left")
-        merged["market_cap_krw"] = pd.to_numeric(merged["market_cap_krw"], errors="coerce").where(
-            pd.to_numeric(merged["market_cap_krw"], errors="coerce").notna(),
-            pd.to_numeric(merged.get("mcap_krw_fill"), errors="coerce"),
-        )
     if not fund.empty:
         merged = merged.merge(fund, on="ticker", how="left")
         merged["dividend_yield_pct"] = pd.to_numeric(merged["dividend_yield_pct"], errors="coerce").where(
@@ -438,24 +833,38 @@ def enrich_kr_fundamentals(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, fl
             pd.to_numeric(merged.get("div_fill"), errors="coerce"),
         )
 
-    out.loc[kr_mask, "market_cap_krw"] = merged["market_cap_krw"].values
     out.loc[kr_mask, "dividend_yield_pct"] = merged["dividend_yield_pct"].values
 
-    after_mc = int(pd.to_numeric(out.loc[kr_mask, "market_cap_krw"], errors="coerce").notna().sum())
     after_div = int(pd.to_numeric(out.loc[kr_mask, "dividend_yield_pct"], errors="coerce").notna().sum())
     return out, {
-        "kr_fund_mcap_filled": float(max(0, after_mc - before_mc)),
         "kr_fund_div_filled": float(max(0, after_div - before_div)),
     }
 
 
 def check_krx_connection() -> Tuple[bool, str]:
     try:
+        key = load_krx_api_key()
+        if key:
+            odf = get_kr_universe_from_openapi(key)
+            if not odf.empty:
+                return True, f"KRX OpenAPI 로딩 OK ({len(odf):,}개)"
+            k_ok, k_msg = test_krx_api_key(key)
+            if not k_ok:
+                return False, k_msg
         k1 = _safe_kr_tickers("KOSPI")
         k2 = _safe_kr_tickers("KOSDAQ")
         total = len(k1) + len(k2)
         if total > 0:
             return True, f"KRX 로딩 OK (KOSPI+KOSDAQ {total:,}개)"
+        finder_df = get_kr_universe_from_krx_finder()
+        if not finder_df.empty:
+            return True, f"KRX Finder 로딩 OK ({len(finder_df):,}개)"
+        kind_df = get_kr_universe_from_kind()
+        if not kind_df.empty:
+            return True, f"KIND 상장목록 로딩 OK ({len(kind_df):,}개)"
+        seed_csv = load_kr_seed_universe()
+        if not seed_csv.empty:
+            return True, f"KR CSV 시드 로딩 OK ({len(seed_csv):,}개)"
         seed_df = kr_universe_from_seed(limit=3000)
         if not seed_df.empty:
             return True, f"KRX 직접 티커는 비었지만 seed 복구 가능 ({len(seed_df):,}개)"
@@ -464,8 +873,15 @@ def check_krx_connection() -> Tuple[bool, str]:
         return False, f"KRX 체크 실패: {e}"
 
 
-@st.cache_data(ttl=3600)
-def get_kr_universe() -> pd.DataFrame:
+@st.cache_data(ttl=120)
+def get_kr_universe(key_hint: str = "") -> pd.DataFrame:
+    key = (key_hint or load_krx_api_key()).strip()
+    if key:
+        openapi_df = get_kr_universe_from_openapi(key)
+        if not openapi_df.empty:
+            save_universe_cache(openapi_df, KR_CACHE_PATH)
+            return openapi_df
+
     rows: List[Dict] = []
     for market, suffix in [("KOSPI", ".KS"), ("KOSDAQ", ".KQ"), ("KONEX", ".KQ")]:
         tickers = _safe_kr_tickers(market)
@@ -479,6 +895,10 @@ def get_kr_universe() -> pd.DataFrame:
     if not out.empty:
         save_universe_cache(out, KR_CACHE_PATH)
         return out
+    finder_df = get_kr_universe_from_krx_finder()
+    if not finder_df.empty:
+        save_universe_cache(finder_df, KR_CACHE_PATH)
+        return finder_df
     # Fallback path for KRX 403 / pykrx upstream instability.
     if fdr is not None:
         try:
@@ -511,6 +931,14 @@ def get_kr_universe() -> pd.DataFrame:
                     return fallback
         except Exception:
             pass
+    kind_df = get_kr_universe_from_kind()
+    if not kind_df.empty:
+        save_universe_cache(kind_df, KR_CACHE_PATH)
+        return kind_df
+    seed_csv = load_kr_seed_universe()
+    if not seed_csv.empty:
+        save_universe_cache(seed_csv, KR_CACHE_PATH)
+        return seed_csv
 
     cached = load_universe_cache(KR_CACHE_PATH)
     if not cached.empty:
@@ -525,6 +953,28 @@ def get_kr_universe() -> pd.DataFrame:
         return seeded
     # Last fallback: small KR sample so KR-only mode remains usable.
     return fallback_kr_universe()
+
+
+def diagnose_kr_sources(key_hint: str = "") -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    key = (key_hint or load_krx_api_key()).strip()
+    checks = [
+        ("krx_openapi", lambda: get_kr_universe_from_openapi(key) if key else pd.DataFrame()),
+        ("pykrx_kospi", lambda: pd.DataFrame({"ticker": _safe_kr_tickers("KOSPI")})),
+        ("pykrx_kosdaq", lambda: pd.DataFrame({"ticker": _safe_kr_tickers("KOSDAQ")})),
+        ("krx_finder", get_kr_universe_from_krx_finder),
+        ("kind_krx", get_kr_universe_from_kind),
+        ("seed_csv_kr", load_kr_seed_universe),
+        ("cache_kr", lambda: load_universe_cache(KR_CACHE_PATH)),
+    ]
+    for name, fn in checks:
+        try:
+            df = fn()
+            n = 0 if df is None else int(len(df))
+            out.append({"소스": name, "결과": f"OK ({n:,})"})
+        except Exception as e:
+            out.append({"소스": name, "결과": f"ERR: {str(e)[:140]}"})
+    return out
 
 
 @st.cache_data(ttl=120)
@@ -632,14 +1082,6 @@ def _build_metrics_from_history(item: Dict, hist: pd.DataFrame, fx: Optional[flo
         except Exception:
             pass
 
-    market_cap = _safe_float(info.get("marketCap"))
-    if item["currency"] == "USD" and fx and market_cap is not None:
-        market_cap_krw = market_cap * fx
-    elif item["currency"] == "KRW":
-        market_cap_krw = market_cap
-    else:
-        market_cap_krw = None
-
     traded_value = None
     if len(close) >= 20 and len(vol) >= 20:
         dv = (hist["Close"] * hist["Volume"]).dropna().tail(20)
@@ -659,14 +1101,18 @@ def _build_metrics_from_history(item: Dict, hist: pd.DataFrame, fx: Optional[flo
     quote_type = str(info.get("quoteType", "")).upper()
     ticker = str(item["ticker"]).upper()
 
-    is_spac = ("SPAC" in name_text) or ("SPAC" in quote_type)
+    is_spac = (
+        ("SPAC" in name_text)
+        or ("SPAC" in quote_type)
+        or ("스팩" in item["name"])
+        or ("기업인수목적" in item["name"])
+    )
     is_etn = ("ETN" in name_text) or ("ETN" in quote_type) or ("EXCHANGE TRADED NOTE" in name_text)
     is_etf = ("ETF" in name_text) or ("ETF" in quote_type) or (quote_type == "ETF")
 
     is_preferred_like = ticker.endswith(("W", "R", "U")) or ("PREFERRED" in name_text) or (" 우" in name_text) or ("우B" in name_text)
     is_untradeable = (info.get("tradeable") is False) or (vol_last == 0)
     is_low_price = (item["market"] == "KR" and price < 1000) or (item["market"] == "US" and price < 1)
-    is_small_cap = market_cap_krw is not None and market_cap_krw < 100_000_000_000
     is_low_liquidity = traded_value_krw is not None and traded_value_krw < 500_000_000
     is_new_listing = listing_days < 30
 
@@ -701,7 +1147,6 @@ def _build_metrics_from_history(item: Dict, hist: pd.DataFrame, fx: Optional[flo
         "price": round(price, 4),
         "price_krw": round(price_krw, 2) if price_krw is not None else None,
         "dividend_yield_pct": round(dy, 4) if dy is not None else None,
-        "market_cap_krw": round(market_cap_krw, 2) if market_cap_krw is not None else None,
         "avg_traded_value_krw_20": round(traded_value_krw, 2) if traded_value_krw is not None else None,
         "listing_days": listing_days,
         **d_ma,
@@ -723,7 +1168,6 @@ def _build_metrics_from_history(item: Dict, hist: pd.DataFrame, fx: Optional[flo
         "is_preferred_like": is_preferred_like,
         "is_untradeable": is_untradeable,
         "is_low_price": is_low_price,
-        "is_small_cap": is_small_cap,
         "is_low_liquidity": is_low_liquidity,
         "is_new_listing": is_new_listing,
         "is_new_high_52w": is_new_high_52w,
@@ -841,22 +1285,19 @@ def enrich_dividend_from_quote(df: pd.DataFrame) -> pd.DataFrame:
 def enrich_quote_snapshot(
     df: pd.DataFrame, fx: Optional[float], limit: int = 2000
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    # Fill lightweight quote fields (dividend, market cap) in batch for final candidates.
+    # Fill lightweight quote fields (dividend only) in batch for final candidates.
     if df.empty:
-        return df, {"quote_targets": 0.0, "quote_div_filled": 0.0, "quote_mcap_filled": 0.0}
+        return df, {"quote_targets": 0.0, "quote_div_filled": 0.0}
     out = df.copy()
     targets = out["yf_ticker"].dropna().astype(str).unique().tolist()
     if limit > 0:
         targets = targets[: int(limit)]
     if not targets:
-        return out, {"quote_targets": 0.0, "quote_div_filled": 0.0, "quote_mcap_filled": 0.0}
+        return out, {"quote_targets": 0.0, "quote_div_filled": 0.0}
 
     before_div = int(pd.to_numeric(out.get("dividend_yield_pct"), errors="coerce").notna().sum())
-    before_mc = int(pd.to_numeric(out.get("market_cap_krw"), errors="coerce").notna().sum())
 
     dy_map: Dict[str, float] = {}
-    mc_map: Dict[str, float] = {}
-    sh_map: Dict[str, float] = {}
     endpoints = [
         "https://query1.finance.yahoo.com/v7/finance/quote",
         "https://query2.finance.yahoo.com/v7/finance/quote",
@@ -894,13 +1335,6 @@ def enrich_quote_snapshot(
                                 vdy = dps / px
                         if vdy is not None:
                             dy_map[sym] = vdy * 100.0
-
-                        vmc = _safe_float(q.get("marketCap"))
-                        if vmc is not None:
-                            mc_map[sym] = vmc
-                        vsh = _safe_float(q.get("sharesOutstanding"))
-                        if vsh is not None:
-                            sh_map[sym] = vsh
                     got = True
                     break
                 except Exception as e:
@@ -913,7 +1347,7 @@ def enrich_quote_snapshot(
 
     # Fallback: per-symbol yfinance for residual missing fields (limited for speed).
     fallback_used = 0
-    if len(dy_map) == 0 or len(mc_map) == 0:
+    if len(dy_map) == 0:
         probe = out[out["yf_ticker"].isin(targets)][["yf_ticker", "price", "currency"]].drop_duplicates()
         probe = probe.head(350)
         for _, r in probe.iterrows():
@@ -921,16 +1355,10 @@ def enrich_quote_snapshot(
             if not sym:
                 continue
             need_div = sym not in dy_map
-            need_mc = sym not in mc_map
-            if not (need_div or need_mc):
+            if not need_div:
                 continue
             try:
                 tk = yf.Ticker(sym)
-                if need_mc:
-                    finfo = getattr(tk, "fast_info", None) or {}
-                    vmc = _safe_float(finfo.get("market_cap"))
-                    if vmc is not None:
-                        mc_map[sym] = vmc
                 if need_div:
                     divs = getattr(tk, "dividends", pd.Series(dtype=float))
                     if isinstance(divs, pd.Series) and not divs.empty:
@@ -951,30 +1379,10 @@ def enrich_quote_snapshot(
             pd.to_numeric(fill_dy, errors="coerce"),
         )
 
-    if mc_map or sh_map:
-        mcap_raw = out["yf_ticker"].map(mc_map)
-        sh_raw = out["yf_ticker"].map(sh_map)
-        px_raw = pd.to_numeric(out.get("price"), errors="coerce")
-        mcap_raw = pd.to_numeric(mcap_raw, errors="coerce")
-        derived = pd.to_numeric(sh_raw, errors="coerce") * px_raw
-        mcap_raw = mcap_raw.where(mcap_raw.notna(), derived)
-        mcap_krw = pd.Series([None] * len(out), index=out.index, dtype="object")
-        usd_mask = out["currency"].eq("USD")
-        krw_mask = out["currency"].eq("KRW")
-        if fx and fx > 0:
-            mcap_krw.loc[usd_mask] = mcap_raw.loc[usd_mask] * fx
-        mcap_krw.loc[krw_mask] = mcap_raw.loc[krw_mask]
-        out["market_cap_krw"] = pd.to_numeric(out.get("market_cap_krw"), errors="coerce").where(
-            pd.to_numeric(out.get("market_cap_krw"), errors="coerce").notna(),
-            pd.to_numeric(mcap_krw, errors="coerce"),
-        )
-
     after_div = int(pd.to_numeric(out.get("dividend_yield_pct"), errors="coerce").notna().sum())
-    after_mc = int(pd.to_numeric(out.get("market_cap_krw"), errors="coerce").notna().sum())
     stats = {
         "quote_targets": float(len(targets)),
         "quote_div_filled": float(max(0, after_div - before_div)),
-        "quote_mcap_filled": float(max(0, after_mc - before_mc)),
         "quote_fallback_used": float(fallback_used),
     }
     return out, stats
@@ -1013,6 +1421,41 @@ def enrich_sector_strength(
     cache_key = cache.drop_duplicates(subset=["market", "ticker_norm"], keep="last")
     out = out.merge(cache_key[["market", "ticker_norm", "sector"]], on=["market", "ticker_norm"], how="left")
     out["sector"] = out["sector"].fillna("Unknown")
+    us_mask = out["market"].eq("US")
+
+    # KR sector fill from KRX stats endpoint.
+    kr_sector = get_kr_sector_map_krx()
+    if kr_sector is not None and not kr_sector.empty:
+        if "ticker_norm" not in kr_sector.columns:
+            kr_sector["ticker_norm"] = kr_sector["ticker"].astype(str).str.zfill(6)
+        out = out.merge(
+            kr_sector[["market", "ticker_norm", "sector"]].rename(columns={"sector": "sector_kr"}),
+            on=["market", "ticker_norm"],
+            how="left",
+        )
+        out["sector"] = out["sector"].where(out["sector"] != "Unknown", out["sector_kr"])
+        out["sector"] = out["sector"].fillna("Unknown")
+        out = out.drop(columns=["sector_kr"], errors="ignore")
+    kr_sector_master = get_kr_sector_map_master()
+    if kr_sector_master is not None and not kr_sector_master.empty:
+        out = out.merge(
+            kr_sector_master[["market", "ticker_norm", "sector"]].rename(columns={"sector": "sector_kr_master"}),
+            on=["market", "ticker_norm"],
+            how="left",
+        )
+        out["sector"] = out["sector"].where(out["sector"] != "Unknown", out["sector_kr_master"])
+        out["sector"] = out["sector"].fillna("Unknown")
+        out = out.drop(columns=["sector_kr_master"], errors="ignore")
+    kr_sector_kind = get_kr_sector_map_kind()
+    if kr_sector_kind is not None and not kr_sector_kind.empty:
+        out = out.merge(
+            kr_sector_kind[["market", "ticker_norm", "sector"]].rename(columns={"sector": "sector_kr_kind"}),
+            on=["market", "ticker_norm"],
+            how="left",
+        )
+        out["sector"] = out["sector"].where(out["sector"] != "Unknown", out["sector_kr_kind"])
+        out["sector"] = out["sector"].fillna("Unknown")
+        out = out.drop(columns=["sector_kr_kind"], errors="ignore")
     # Fill from static seed map first (KRX/FDR), then call network for residual unknown.
     seed = get_sector_seed_map()
     if seed is not None and not seed.empty:
@@ -1027,6 +1470,7 @@ def enrich_sector_strength(
         out["sector"] = out["sector"].fillna("Unknown")
         out = out.drop(columns=["sector_seed"], errors="ignore")
 
+    # Fetch residual unknown sectors for both US and KR (scoring is still market-separated).
     missing = out[out["sector"].eq("Unknown")][["market", "ticker", "yf_ticker"]].drop_duplicates()
     if sector_fetch_limit > 0:
         take_n = min(int(sector_fetch_limit), len(missing))
@@ -1090,10 +1534,10 @@ def enrich_sector_strength(
         out["sector"] = out["sector"].fillna("Unknown")
         out = out.drop(columns=["sector_cache"], errors="ignore")
 
-    known = out[out["sector"] != "Unknown"].copy()
+    known = out[out["sector"].ne("Unknown")].copy()
     if not known.empty:
         grp = (
-            known.groupby("sector", as_index=False)
+            known.groupby(["market", "sector"], as_index=False)
             .agg(
                 sector_new_high_count=("is_new_high_52w", "sum"),
                 sector_total=("ticker", "count"),
@@ -1104,8 +1548,8 @@ def enrich_sector_strength(
             grp["sector_new_high_count"].rank(pct=True).fillna(0.0) * 100.0
         ).round(2)
         out = out.merge(
-            grp[["sector", "sector_new_high_count", "sector_new_high_ratio", "sector_strength_score"]],
-            on="sector",
+            grp[["market", "sector", "sector_new_high_count", "sector_new_high_ratio", "sector_strength_score"]],
+            on=["market", "sector"],
             how="left",
         )
     else:
@@ -1115,12 +1559,14 @@ def enrich_sector_strength(
 
     out["sector_strength_score"] = out["sector_strength_score"].fillna(0.0)
     out = out.drop(columns=["ticker_norm"], errors="ignore")
-    covered = float((out["sector"] != "Unknown").mean() * 100.0)
+    covered = float((out.loc[us_mask, "sector"] != "Unknown").mean() * 100.0) if us_mask.any() else 0.0
+    covered_kr = float((out.loc[~us_mask, "sector"] != "Unknown").mean() * 100.0) if (~us_mask).any() else 0.0
     stats = {
         "sector_cached": float(len(cache_key)),
         "sector_seeded": float(0 if seed is None else len(seed)),
         "sector_fetched": float(len(fetched_rows)),
         "sector_covered": round(covered, 2),
+        "sector_covered_kr": round(covered_kr, 2),
         "sector_timeout": float(timed_out),
         "sector_pick_mode": sector_pick_mode,
         "sector_pick_limit": float(sector_fetch_limit),
@@ -1278,8 +1724,7 @@ def apply_hard_exclusions(df: pd.DataFrame) -> pd.DataFrame:
         return ~pd.to_numeric(df.get(col, False), errors="coerce").fillna(0).astype(bool)
 
     return df[
-        ok("is_small_cap")
-        & ok("is_spac")
+        ok("is_spac")
         & ok("is_etn")
         & ok("is_low_liquidity")
         & ok("is_untradeable")
@@ -1366,7 +1811,10 @@ def enrich_score(df: pd.DataFrame) -> pd.DataFrame:
             out["dividend_yield_pct"] = pd.Series(dtype=float)
         return out
     out["dividend_yield_pct"] = out["dividend_yield_pct"].fillna(0.0)
-    out["yield_rank"] = out["dividend_yield_pct"].rank(pct=True)
+    if "market" in out.columns:
+        out["yield_rank"] = out.groupby("market")["dividend_yield_pct"].rank(pct=True)
+    else:
+        out["yield_rank"] = out["dividend_yield_pct"].rank(pct=True)
     out["trend_score"] = (
         out["price_above_120"].fillna(False).astype(float) * 0.2
         + out["ma60_up"].fillna(False).astype(float) * 0.2
@@ -1422,13 +1870,15 @@ def main() -> None:
 
     with st.sidebar:
         st.header("기본 옵션")
-        market_mode = st.radio("시장 모드", ["국장(KR)", "미장(US)", "통합(KR+US)"], index=0)
+        market_mode = st.radio("시장 모드", ["국장(KR)", "미장(US)", "통합(KR+US)"], index=2)
         if market_mode == "국장(KR)":
             markets = ["KR"]
         elif market_mode == "미장(US)":
             markets = ["US"]
         else:
             markets = ["KR", "US"]
+        if market_mode == "통합(KR+US)":
+            st.caption("권장: 국장/미장은 분리 스캔이 더 안정적입니다.")
         etf_mode = st.selectbox("ETF 모드", ["전체", "ETF만", "ETF 제외"], index=0)
 
         st.divider()
@@ -1449,6 +1899,10 @@ def main() -> None:
                 if st.button("키 저장"):
                     if save_krx_api_key(key_input):
                         st.session_state["krx_api_key"] = key_input.strip()
+                        try:
+                            get_kr_universe.clear()
+                        except Exception:
+                            pass
                         st.success("키 저장 완료")
                     else:
                         st.error("키 저장 실패")
@@ -1460,13 +1914,36 @@ def main() -> None:
                         st.success(msg)
                     else:
                         st.error(msg)
+            if st.button("KR 목록 캐시 새로고침"):
+                try:
+                    get_kr_universe.clear()
+                except Exception:
+                    pass
+                st.success("KR 목록 캐시를 초기화했습니다.")
             with k3:
                 if st.button("키 삭제"):
                     save_krx_api_key("")
                     st.session_state["krx_api_key"] = ""
+                    try:
+                        get_kr_universe.clear()
+                    except Exception:
+                        pass
                     st.success("키 삭제 완료")
             if st.session_state.get("krx_api_test"):
                 st.caption(f"마지막 테스트: {st.session_state['krx_api_test']}")
+            st.divider()
+            st.caption("KR 종목 CSV 업로드 (종목코드/ticker 컬럼 필수)")
+            up = st.file_uploader("KR 시드 CSV", type=["csv"], key="kr_seed_upload")
+            if up is not None and st.button("KR CSV 저장"):
+                ok, msg = save_kr_seed_universe(up)
+                if ok:
+                    try:
+                        get_kr_universe.clear()
+                    except Exception:
+                        pass
+                    st.success(msg)
+                else:
+                    st.error(msg)
 
         st.divider()
         st.subheader("가격 범위 (KRW)")
@@ -1639,7 +2116,7 @@ def main() -> None:
 
     if "KR" in markets:
         try:
-            kr_df = get_kr_universe()
+            kr_df = get_kr_universe(st.session_state.get("krx_api_key", ""))
         except Exception as e:
             source_errors.append(f"KR 목록 로딩 실패: {e}")
             kr_df = pd.DataFrame()
@@ -1648,6 +2125,9 @@ def main() -> None:
         st.warning("KRX 목록을 가져오지 못했습니다. 네트워크/거래소 응답 상태를 'KRX 연결 체크'로 먼저 확인하세요.")
     elif "KR" in markets and (not kr_df.empty) and ("_source" in kr_df.columns) and (kr_df["_source"].eq("fallback_kr_sample").all()):
         st.warning("KR 실데이터 소스 연결 실패로 fallback KR 샘플 목록으로 실행 중입니다.")
+        with st.expander("KR 소스 진단 보기", expanded=False):
+            diag_rows = diagnose_kr_sources(st.session_state.get("krx_api_key", ""))
+            st.dataframe(pd.DataFrame(diag_rows), use_container_width=True, hide_index=True)
     if source_errors:
         st.error("데이터 소스 오류 감지:\n- " + "\n- ".join(source_errors))
 
@@ -1680,7 +2160,7 @@ def main() -> None:
     kr_source = (kr_df["_source"].value_counts().index[0] if (not kr_df.empty and "_source" in kr_df.columns) else "none")
     st.caption(f"목록 소스: US={us_source}, KR={kr_source}")
     force_exclusion_notice = st.empty()
-    force_exclusion_notice.info("강제 제외: 시총<1,000억 / SPAC / ETN / 저유동성 / 거래불가 / 우선주류 / 초저가 / 신규상장")
+    force_exclusion_notice.info("강제 제외: SPAC / ETN / 저유동성 / 거래불가 / 우선주류 / 초저가 / 신규상장")
     diag_col1, diag_col2 = st.columns(2)
     with diag_col1:
         if st.button("실행 전 KRX 상태 확인"):
@@ -1807,15 +2287,16 @@ def main() -> None:
             scan_stats.update(quote_stats)
         if not filtered.empty and "dividend_yield_pct" in filtered.columns:
             scan_stats["dividend_covered_pct"] = round(float(pd.to_numeric(filtered["dividend_yield_pct"], errors="coerce").notna().mean() * 100.0), 2)
-        if not filtered.empty and "market_cap_krw" in filtered.columns:
-            scan_stats["mcap_covered_pct"] = round(float(pd.to_numeric(filtered["market_cap_krw"], errors="coerce").notna().mean() * 100.0), 2)
         if not filtered.empty and "sector" in filtered.columns:
-            scan_stats["sector_final_covered_pct"] = round(float((filtered["sector"].fillna("Unknown") != "Unknown").mean() * 100.0), 2)
+            usf = filtered[filtered["market"].astype(str).str.upper().eq("US")]
+            if not usf.empty:
+                scan_stats["sector_final_covered_pct"] = round(float((usf["sector"].fillna("Unknown") != "Unknown").mean() * 100.0), 2)
+            else:
+                scan_stats["sector_final_covered_pct"] = 0.0
 
         t_score0 = time.time()
         filtered = enrich_score(filtered)
         scan_stats["t_score_sec"] = round(time.time() - t_score0, 2)
-        filtered["시가총액(억원)"] = pd.to_numeric(filtered.get("market_cap_krw"), errors="coerce").apply(_to_eok)
         filtered["20일평균거래대금(억원)"] = pd.to_numeric(filtered.get("avg_traded_value_krw_20"), errors="coerce").apply(_to_eok)
         if "score" not in filtered.columns:
             filtered["score"] = pd.Series([0.0] * len(filtered), index=filtered.index, dtype=float)
@@ -1860,10 +2341,9 @@ def main() -> None:
                 view = view[view["ticker"].str.lower().str.contains(s, na=False) | view["name"].str.lower().str.contains(s, na=False)]
             view["가격표시"] = pd.to_numeric(view["price"], errors="coerce").map(lambda v: f"{v:,.2f}" if pd.notna(v) else "-")
             view["현재가(KRW)표시"] = pd.to_numeric(view["price_krw"], errors="coerce").map(lambda v: f"{v:,.2f}" if pd.notna(v) else "-")
-            view["시가총액(억원)표시"] = pd.to_numeric(view["시가총액(억원)"], errors="coerce").map(lambda v: f"{v:,.2f}" if pd.notna(v) else "-")
             view["20일평균거래대금(억원)표시"] = pd.to_numeric(view["20일평균거래대금(억원)"], errors="coerce").map(lambda v: f"{v:,.2f}" if pd.notna(v) else "-")
             cols = [
-                "score", "market", "ticker", "name", "가격표시", "현재가(KRW)표시", "시가총액(억원)표시", "20일평균거래대금(억원)표시", "dividend_yield_pct",
+                "score", "market", "ticker", "name", "가격표시", "현재가(KRW)표시", "20일평균거래대금(억원)표시", "dividend_yield_pct",
                 "sector", "sector_strength_score", "sector_new_high_count", "sector_new_high_ratio",
                 "D_ma20", "D_ma60", "D_ma120", "W_ma20", "W_ma60", "W_ma120", "M_ma20", "M_ma60", "M_ma120",
                 "price_above_120", "ma60_up", "pullback_20", "vol_surge", "box_breakout", "strong_trend", "general_trend",
@@ -1898,7 +2378,6 @@ def main() -> None:
                 "box_breakout": "박스돌파",
                 "strong_trend": "강한상승",
                 "general_trend": "일반상승",
-                "시가총액(억원)표시": "시가총액(억원)",
                 "20일평균거래대금(억원)표시": "20일평균거래대금(억원)",
                 "listing_days": "상장일수",
             }
@@ -1999,17 +2478,15 @@ def main() -> None:
                 {"항목": "섹터 보강 상한", "값": int(scan_stats.get("sector_pick_limit", 0)) if "sector_pick_limit" in scan_stats else "-"},
                 {"항목": "KRX 키 저장 여부", "값": "Y" if bool(st.session_state.get("krx_api_key", "").strip()) else "N"},
                 {"항목": "섹터 커버율(%)", "값": scan_stats.get("sector_covered", "-")},
+                {"항목": "KR 섹터 커버율(%)", "값": scan_stats.get("sector_covered_kr", "-")},
                 {"항목": "섹터 수집 타임아웃", "값": int(scan_stats.get("sector_timeout", 0)) if "sector_timeout" in scan_stats else 0},
                 {"항목": "섹터 수집시간 사용(초)", "값": int(scan_stats.get("sector_max_seconds_used", 0)) if "sector_max_seconds_used" in scan_stats else "-"},
                 {"항목": "최종 섹터 커버율(%)", "값": scan_stats.get("sector_final_covered_pct", "-")},
                 {"항목": "배당 커버율(%)", "값": scan_stats.get("dividend_covered_pct", "-")},
-                {"항목": "시총 커버율(%)", "값": scan_stats.get("mcap_covered_pct", "-")},
                 {"항목": "보강 대상 수", "값": int(scan_stats.get("quote_targets", 0)) if "quote_targets" in scan_stats else "-"},
                 {"항목": "배당 보강 건수", "값": int(scan_stats.get("quote_div_filled", 0)) if "quote_div_filled" in scan_stats else "-"},
-                {"항목": "시총 보강 건수", "값": int(scan_stats.get("quote_mcap_filled", 0)) if "quote_mcap_filled" in scan_stats else "-"},
                 {"항목": "개별 보강 호출수", "값": int(scan_stats.get("quote_fallback_used", 0)) if "quote_fallback_used" in scan_stats else "-"},
                 {"항목": "KR 배당 보강 건수", "값": int(scan_stats.get("kr_fund_div_filled", 0)) if "kr_fund_div_filled" in scan_stats else "-"},
-                {"항목": "KR 시총 보강 건수", "값": int(scan_stats.get("kr_fund_mcap_filled", 0)) if "kr_fund_mcap_filled" in scan_stats else "-"},
             ]
             st.markdown("#### 임시 디버그 정보")
             st.dataframe(pd.DataFrame(debug_rows), use_container_width=True, height=280)
