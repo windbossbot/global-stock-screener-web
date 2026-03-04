@@ -1582,10 +1582,12 @@ def _run_scan_batched(
     none_count = 0
     err_count = 0
     t0 = time.time()
-    batch_size = 350
+    batch_size = 140
     current_batch = batch_size
     current_threads = max(2, min(int(workers), 12))
     adaptive_down_count = 0
+    stalled_batches = 0
+    batch_timeout_sec = 18
     done = 0
     bar = st.progress(0, text="스캔 계산 중(배치 모드)...")
     i = 0
@@ -1598,6 +1600,7 @@ def _run_scan_batched(
             i += len(batch_items)
             continue
         data = pd.DataFrame()
+        batch_started_at = time.time()
         for retry in range(2):
             try:
                 data = yf.download(
@@ -1609,11 +1612,14 @@ def _run_scan_batched(
                     group_by="ticker",
                     threads=current_threads,
                     progress=False,
+                    timeout=10,
                 )
                 if data is not None and not data.empty:
                     break
             except Exception:
                 pass
+            if (time.time() - batch_started_at) > batch_timeout_sec:
+                break
             time.sleep(0.6 * (retry + 1))
         if data is None or data.empty:
             err_count += len(batch_items)
@@ -1622,9 +1628,34 @@ def _run_scan_batched(
             current_batch = max(80, int(current_batch * 0.7))
             current_threads = max(2, current_threads - 1)
             adaptive_down_count += 1
+            stalled_batches += 1
+            # If batch mode keeps stalling, switch to per-ticker history mode for remaining items.
+            if stalled_batches >= 3 and i + len(batch_items) < len(items):
+                remain = items[i + len(batch_items):]
+                if remain:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=current_threads) as ex:
+                        futures = [ex.submit(_compute_metrics, it, fx, False, history_period) for it in remain]
+                        for idx, f in enumerate(concurrent.futures.as_completed(futures), start=1):
+                            try:
+                                r = f.result()
+                                if r:
+                                    rows.append(r)
+                                else:
+                                    none_count += 1
+                            except Exception:
+                                err_count += 1
+                            done += 1
+                            if idx % 12 == 0 or idx == len(futures):
+                                bar.progress(
+                                    int(done * 100 / max(1, len(items))),
+                                    text=f"스캔 계산 중(폴백 모드)... {done}/{len(items)}",
+                                )
+                i = len(items)
+                break
             time.sleep(0.8)
             i += len(batch_items)
             continue
+        stalled_batches = 0
         batch_success = 0
         for it in batch_items:
             hist = _extract_history_from_download(data, it["yf_ticker"])
