@@ -1,5 +1,6 @@
 import concurrent.futures
 from datetime import datetime, timedelta
+import json
 import os
 from pathlib import Path
 import threading
@@ -80,6 +81,7 @@ SECTOR_SEED_PATH = CACHE_DIR / "sector_seed.csv"
 KRX_KEY_PATH = CACHE_DIR / "krx_api_key.txt"
 KR_SEED_PATH = CACHE_DIR / "kr_universe_seed.csv"
 KR_SECTOR_MASTER_PATH = CACHE_DIR / "kr_sector_master.csv"
+FILTERS_PATH = CACHE_DIR / "saved_filters.json"
 RESULT_EXPORT_DIR = CACHE_DIR / "exports"
 RESULT_EXPORT_LATEST_PATH = RESULT_EXPORT_DIR / "latest_screener.csv"
 KRX_OPENAPI_ENDPOINTS = [
@@ -146,6 +148,47 @@ def save_universe_cache(df: pd.DataFrame, path: Path) -> None:
         df.to_csv(path, index=False, encoding="utf-8-sig")
     except Exception:
         pass
+
+
+def load_saved_filters() -> Dict[str, Dict]:
+    try:
+        if FILTERS_PATH.exists():
+            raw = json.loads(FILTERS_PATH.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                out: Dict[str, Dict] = {}
+                for k, v in raw.items():
+                    if not isinstance(k, str) or not isinstance(v, dict):
+                        continue
+                    out[k] = {
+                        "market_mode": str(v.get("market_mode", "통합(KR+US)")),
+                        "selected_conditions": [str(x) for x in v.get("selected_conditions", []) if str(x).strip()],
+                        "tf_rule_map": dict(v.get("tf_rule_map", {})),
+                        "near_tf_label": str(v.get("near_tf_label", "사용 안함")),
+                        "near_periods": [int(x) for x in v.get("near_periods", []) if str(x).isdigit()],
+                        "near_pct": float(v.get("near_pct", 3.0)),
+                        "min_price": float(v.get("min_price", 0.0)),
+                        "max_price": float(v.get("max_price", 0.0)),
+                        "etf_mode": str(v.get("etf_mode", "ETF 포함")),
+                        "dividend_only": bool(v.get("dividend_only", False)),
+                        "dividend_cycles": [str(x) for x in v.get("dividend_cycles", []) if str(x).strip()],
+                        "per_max": float(v.get("per_max", 0.0)),
+                        "roe_min": float(v.get("roe_min", 0.0)),
+                        "per_roe_max": float(v.get("per_roe_max", 0.0)),
+                        "ev_to_ebitda_max": float(v.get("ev_to_ebitda_max", 0.0)),
+                    }
+                return out
+    except Exception:
+        pass
+    return {}
+
+
+def save_saved_filters(data: Dict[str, Dict]) -> bool:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        FILTERS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+    except Exception:
+        return False
 
 
 def save_result_csv(df: pd.DataFrame) -> Tuple[bool, str]:
@@ -1428,8 +1471,18 @@ def _build_metrics_from_history(item: Dict, hist: pd.DataFrame, fx: Optional[flo
     )
     is_etn = ("ETN" in name_text) or ("ETN" in quote_type) or ("EXCHANGE TRADED NOTE" in name_text)
     is_etf = etf_hint or ("ETF" in name_text) or ("ETF" in quote_type) or (quote_type == "ETF")
-
-    is_preferred_like = ticker.endswith(("W", "R", "U")) or ("PREFERRED" in name_text) or (" 우" in name_text) or ("우B" in name_text)
+    is_leveraged_etf = is_etf and any(token in name_text for token in ["2X", "3X", "ULTRA", "LEVERAGED", "레버리지"])
+    is_inverse_etf = is_etf and any(token in name_text for token in ["INVERSE", "SHORT", "BEAR", "인버스"])
+    is_single_stock_etf = is_etf and any(token in name_text for token in ["SINGLE STOCK", "SINGLE-STOCK"])
+    is_warrant_rights = (
+        ticker.endswith(("W", "R", "RT", "WS"))
+        or ("WARRANT" in name_text)
+        or ("RIGHT" in name_text)
+        or ("워런트" in name_text)
+        or ("신주인수권" in name_text)
+        or ("리츠인수권" in name_text)
+    )
+    is_preferred_like = is_warrant_rights or ("PREFERRED" in name_text) or (" 우" in name_text) or ("우B" in name_text)
     is_untradeable = (info.get("tradeable") is False) or (vol_last == 0)
     is_low_price = (item["market"] == "KR" and price < 1000) or (item["market"] == "US" and price < 1)
     is_low_liquidity = traded_value_krw is not None and traded_value_krw < 500_000_000
@@ -1496,6 +1549,10 @@ def _build_metrics_from_history(item: Dict, hist: pd.DataFrame, fx: Optional[flo
         "is_spac": is_spac,
         "is_etn": is_etn,
         "is_etf": is_etf,
+        "is_leveraged_etf": is_leveraged_etf,
+        "is_inverse_etf": is_inverse_etf,
+        "is_single_stock_etf": is_single_stock_etf,
+        "is_warrant_rights": is_warrant_rights,
         "is_preferred_like": is_preferred_like,
         "is_untradeable": is_untradeable,
         "is_low_price": is_low_price,
@@ -2328,6 +2385,75 @@ def run_scan(
     return pd.DataFrame(rows), stats
 
 
+def normalize_etf_mode(mode: str) -> str:
+    txt = str(mode).strip()
+    if txt == "전체":
+        return "ETF 포함"
+    if txt == "ETF 제외":
+        return "ETF 미포함"
+    if txt == "ETF만":
+        return "ETF 만"
+    if txt in {"ETF 포함", "ETF 미포함", "ETF 만"}:
+        return txt
+    return "ETF 포함"
+
+
+def build_filter_context(
+    *,
+    min_price: float,
+    max_price: float,
+    etf_mode: str,
+    dividend_only: bool,
+    dividend_cycles: List[str],
+    tf_rule_map: Dict[str, str],
+    near_tf_label: str,
+    near_periods: List[int],
+    near_pct: float,
+) -> Dict[str, object]:
+    tf_rules: List[Tuple[str, str, int]] = []
+    for key in ["M_20", "M_60", "M_120", "W_20", "W_60", "W_120", "D_20", "D_60", "D_120"]:
+        op = tf_rule_map.get(key, "패스")
+        if op not in [">", "<"]:
+            continue
+        tf, period = key.split("_")
+        tf_rules.append((tf, op, int(period)))
+    near_tf = None
+    if near_tf_label != "사용 안함" and near_periods:
+        near_tf = {"일봉": "D", "주봉": "W", "월봉": "M"}.get(str(near_tf_label).strip())
+    return {
+        "min_price": float(min_price),
+        "max_price": float(max_price),
+        "etf_mode": normalize_etf_mode(etf_mode),
+        "dividend_only": bool(dividend_only),
+        "dividend_cycles": [str(x).strip() for x in dividend_cycles if str(x).strip()],
+        "tf_rules": tf_rules,
+        "near_tf": near_tf,
+        "near_periods": list(near_periods),
+        "near_pct": float(near_pct),
+    }
+
+
+def apply_price_filter(df: pd.DataFrame, min_price: float, max_price: float) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    price_krw = out.get("price_krw")
+    if isinstance(price_krw, pd.Series):
+        price_basis = price_krw.where(price_krw.notna(), out.get("price"))
+    else:
+        price_basis = out.get("price")
+    price_basis = pd.to_numeric(price_basis, errors="coerce")
+    out = out[price_basis >= float(min_price)]
+    if max_price > 0:
+        next_basis = out.get("price")
+        price_krw_next = out.get("price_krw")
+        if isinstance(price_krw_next, pd.Series):
+            next_basis = price_krw_next.where(price_krw_next.notna(), out.get("price"))
+        next_basis = pd.to_numeric(next_basis, errors="coerce")
+        out = out[next_basis <= float(max_price)]
+    return out
+
+
 def prefilter_universe_fast(
     universe: pd.DataFrame,
     etf_mode: str,
@@ -2338,15 +2464,16 @@ def prefilter_universe_fast(
     if universe.empty:
         return universe
     out = universe.copy()
+    etf_mode_norm = normalize_etf_mode(etf_mode)
     selected_cycles = [str(x).strip() for x in (dividend_cycles or []) if str(x).strip()]
     name_series = out["name"].fillna("").str.upper()
     etf_hint = pd.Series(False, index=out.index)
     if "is_etf_hint" in out.columns:
         etf_hint = out["is_etf_hint"].fillna("").astype(str).str.strip().str.lower().isin(["1", "true", "t", "yes", "y"])
     etf_like = name_series.str.contains("ETF", regex=False) | etf_hint
-    if etf_mode == "전체":
+    if etf_mode_norm == "ETF 포함":
         pass
-    elif etf_mode == "ETF만":
+    elif etf_mode_norm == "ETF 만":
         out = out[etf_like]
     else:
         out = out[~etf_like]
@@ -2361,6 +2488,24 @@ def prefilter_universe_fast(
     return out
 
 
+def apply_prefilter_pipeline(universe: pd.DataFrame, ctx: Dict[str, object]) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    out = universe.copy()
+    counts = {"pre_input": len(out)}
+    out = prefilter_universe_fast(
+        out,
+        str(ctx.get("etf_mode", "ETF 포함")),
+        dividend_only=bool(ctx.get("dividend_only", False)),
+        dividend_cycles=list(ctx.get("dividend_cycles", [])),
+    )
+    counts["pre_etf"] = len(out)
+    counts["pre_dividend_cycle"] = len(out)
+    counts["pre_dividend_only"] = len(out)
+    if ("price" in out.columns) or ("price_krw" in out.columns):
+        out = apply_price_filter(out, float(ctx.get("min_price", 0.0)), float(ctx.get("max_price", 0.0)))
+    counts["pre_price"] = len(out)
+    return out, counts
+
+
 def apply_hard_exclusions(df: pd.DataFrame) -> pd.DataFrame:
     # Missing boolean flags should not be treated as hard-fail.
     def ok(col: str) -> pd.Series:
@@ -2369,6 +2514,10 @@ def apply_hard_exclusions(df: pd.DataFrame) -> pd.DataFrame:
     return df[
         ok("is_spac")
         & ok("is_etn")
+        & ok("is_leveraged_etf")
+        & ok("is_inverse_etf")
+        & ok("is_single_stock_etf")
+        & ok("is_warrant_rights")
         & ok("is_low_liquidity")
         & ok("is_untradeable")
         & ok("is_preferred_like")
@@ -2378,9 +2527,10 @@ def apply_hard_exclusions(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def apply_etf_mode(df: pd.DataFrame, mode: str) -> pd.DataFrame:
-    if mode == "ETF만":
+    mode_norm = normalize_etf_mode(mode)
+    if mode_norm == "ETF 만":
         return df[df["is_etf"] == True]
-    if mode == "ETF 제외":
+    if mode_norm == "ETF 미포함":
         return df[df["is_etf"] == False]
     return df
 
@@ -2492,26 +2642,69 @@ def enrich_score(df: pd.DataFrame) -> pd.DataFrame:
     if out.empty:
         if "score" not in out.columns:
             out["score"] = pd.Series(dtype=float)
+        if "priority_bucket" not in out.columns:
+            out["priority_bucket"] = pd.Series(dtype=float)
         if "dividend_yield_pct" not in out.columns:
             out["dividend_yield_pct"] = pd.Series(dtype=float)
         return out
-    out["dividend_yield_pct"] = out["dividend_yield_pct"].fillna(0.0)
-    if "market" in out.columns:
-        out["yield_rank"] = out.groupby("market")["dividend_yield_pct"].rank(pct=True)
-    else:
-        out["yield_rank"] = out["dividend_yield_pct"].rank(pct=True)
+    out["dividend_yield_pct"] = _numeric_series(out, "dividend_yield_pct").fillna(0.0)
+
+    def market_rank(col: str, ascending: bool, neutral: float = 0.5) -> pd.Series:
+        num = _numeric_series(out, col)
+        if "market" in out.columns:
+            ranked = num.groupby(out["market"]).rank(pct=True, ascending=ascending)
+        else:
+            ranked = num.rank(pct=True, ascending=ascending)
+        return ranked.fillna(neutral)
+
+    out["yield_rank"] = market_rank("dividend_yield_pct", ascending=True, neutral=0.0)
+    cycle_bonus = out.get("dividend_cycle", pd.Series("", index=out.index)).fillna("").map(
+        {"월배당": 1.0, "분기배당": 0.8, "반기배당": 0.55, "연배당": 0.35}
+    ).fillna(0.0)
+    has_dividend = ((out["dividend_yield_pct"] > 0).fillna(False) | cycle_bonus.gt(0)).astype(float)
+    out["dividend_score"] = ((out["yield_rank"] * 0.7) + (cycle_bonus * 0.2) + (has_dividend * 0.1)).clip(0, 1)
+
     out["trend_score"] = (
-        out["price_above_120"].fillna(False).astype(float) * 0.2
-        + out["ma60_up"].fillna(False).astype(float) * 0.2
-        + out["strong_trend"].fillna(False).astype(float) * 0.25
-        + out["vol_surge"].fillna(False).astype(float) * 0.15
-        + out["box_breakout"].fillna(False).astype(float) * 0.2
+        out["price_above_120"].fillna(False).astype(float) * 0.16
+        + out["ma60_up"].fillna(False).astype(float) * 0.14
+        + out["strong_trend"].fillna(False).astype(float) * 0.26
+        + out["general_trend"].fillna(False).astype(float) * 0.10
+        + out["pullback_20"].fillna(False).astype(float) * 0.12
+        + out["vol_surge"].fillna(False).astype(float) * 0.08
+        + out["box_breakout"].fillna(False).astype(float) * 0.14
+    ).clip(0, 1)
+
+    valuation_parts = pd.concat(
+        [
+            market_rank("per", ascending=False, neutral=0.45),
+            market_rank("roe_pct", ascending=True, neutral=0.45),
+            market_rank("per_roe_ratio", ascending=False, neutral=0.45),
+            market_rank("ev_to_ebitda", ascending=False, neutral=0.45),
+        ],
+        axis=1,
     )
+    out["valuation_score"] = valuation_parts.mean(axis=1).fillna(0.45).clip(0, 1)
+    out["liquidity_score"] = market_rank("avg_traded_value_krw_20", ascending=True, neutral=0.35).clip(0, 1)
     if "sector_strength_score" in out.columns:
         sector_norm = (pd.to_numeric(out["sector_strength_score"], errors="coerce").fillna(0.0) / 100.0).clip(0, 1)
     else:
         sector_norm = pd.Series(0.0, index=out.index)
-    out["score"] = ((out["yield_rank"] * 0.35) + (out["trend_score"] * 0.45) + (sector_norm * 0.20)) * 100
+    out["priority_bucket"] = (
+        out["price_above_120"].fillna(False).astype(int) * 2
+        + out["strong_trend"].fillna(False).astype(int) * 2
+        + out["ma60_up"].fillna(False).astype(int)
+        + out["general_trend"].fillna(False).astype(int)
+        + has_dividend.astype(int)
+        + cycle_bonus.ge(0.8).astype(int)
+        + out["valuation_score"].ge(0.65).astype(int)
+    )
+    out["score"] = (
+        (out["trend_score"] * 0.42)
+        + (out["dividend_score"] * 0.24)
+        + (out["valuation_score"] * 0.19)
+        + (sector_norm * 0.10)
+        + (out["liquidity_score"] * 0.05)
+    ) * 100
     out["score"] = out["score"].round(2)
     return out
 
@@ -2543,7 +2736,9 @@ def main() -> None:
     )
 
     if "saved_filters" not in st.session_state:
-        st.session_state["saved_filters"] = {}
+        st.session_state["saved_filters"] = load_saved_filters()
+    if "krx_api_key" not in st.session_state:
+        st.session_state["krx_api_key"] = load_krx_api_key()
     if "active_filter" not in st.session_state:
         st.session_state["active_filter"] = None
     if "active_filter_name" not in st.session_state:
@@ -2552,10 +2747,112 @@ def main() -> None:
         st.session_state["last_filtered"] = None
     if "last_summary" not in st.session_state:
         st.session_state["last_summary"] = ""
+    if "pending_filter_name" not in st.session_state:
+        st.session_state["pending_filter_name"] = ""
+    defaults = {
+        "ui_market_mode": "통합(KR+US)",
+        "ui_etf_mode": "ETF 포함",
+        "ui_dividend_only": False,
+        "ui_dividend_cycles": [],
+        "ui_min_price_text": "0",
+        "ui_max_price_text": "0",
+        "ui_selected_conditions": [],
+        "ui_near_tf_label": "사용 안함",
+        "ui_near_periods": [],
+        "ui_near_pct": 3.0,
+        "ui_per_max": 0.0,
+        "ui_roe_min": 0.0,
+        "ui_per_roe_max": 0.0,
+        "ui_ev_to_ebitda_max": 0.0,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+    for rule_key in ["rule_d20", "rule_d60", "rule_d120", "rule_w20", "rule_w60", "rule_w120", "rule_m20", "rule_m60", "rule_m120"]:
+        if rule_key not in st.session_state:
+            st.session_state[rule_key] = "패스"
+
+    pending_filter_name = str(st.session_state.get("pending_filter_name", "")).strip()
+    if pending_filter_name:
+        cfg = st.session_state.get("saved_filters", {}).get(pending_filter_name)
+        if isinstance(cfg, dict):
+            rule_map = cfg.get("tf_rule_map", {})
+            st.session_state["ui_market_mode"] = str(cfg.get("market_mode", "통합(KR+US)"))
+            st.session_state["ui_etf_mode"] = normalize_etf_mode(str(cfg.get("etf_mode", "ETF 포함")))
+            st.session_state["ui_dividend_only"] = bool(cfg.get("dividend_only", False))
+            st.session_state["ui_dividend_cycles"] = [str(x) for x in cfg.get("dividend_cycles", []) if str(x).strip()]
+            st.session_state["ui_min_price_text"] = str(cfg.get("min_price", 0.0))
+            st.session_state["ui_max_price_text"] = str(cfg.get("max_price", 0.0))
+            st.session_state["ui_selected_conditions"] = [str(x) for x in cfg.get("selected_conditions", []) if str(x).strip()]
+            st.session_state["ui_near_tf_label"] = str(cfg.get("near_tf_label", "사용 안함"))
+            st.session_state["ui_near_periods"] = [int(x) for x in cfg.get("near_periods", []) if str(x).isdigit()]
+            st.session_state["ui_near_pct"] = float(cfg.get("near_pct", 3.0))
+            st.session_state["ui_per_max"] = float(cfg.get("per_max", 0.0))
+            st.session_state["ui_roe_min"] = float(cfg.get("roe_min", 0.0))
+            st.session_state["ui_per_roe_max"] = float(cfg.get("per_roe_max", 0.0))
+            st.session_state["ui_ev_to_ebitda_max"] = float(cfg.get("ev_to_ebitda_max", 0.0))
+            for map_key, state_key in [
+                ("D_20", "rule_d20"),
+                ("D_60", "rule_d60"),
+                ("D_120", "rule_d120"),
+                ("W_20", "rule_w20"),
+                ("W_60", "rule_w60"),
+                ("W_120", "rule_w120"),
+                ("M_20", "rule_m20"),
+                ("M_60", "rule_m60"),
+                ("M_120", "rule_m120"),
+            ]:
+                st.session_state[state_key] = str(rule_map.get(map_key, "패스"))
+            st.session_state["active_filter"] = cfg
+            st.session_state["active_filter_name"] = pending_filter_name
+        st.session_state["pending_filter_name"] = ""
+
+    condition_options = [
+        "1) 주가 > 120MA",
+        "2) 60MA 우상향",
+        "3) 20MA 눌림목",
+        "4) 거래량 증가",
+        "강한 상승 구조 (5>20>60>120)",
+        "일반 상승 구조 (20>60>120)",
+        "하락 구조 제외 (주가<120MA 제거)",
+        "단기 가속 (5MA>20MA)",
+        "중장기 강세 (60MA>120MA)",
+    ]
 
     with st.sidebar:
         st.header("기본 옵션")
-        market_mode = st.radio("시장 모드", ["국장(KR)", "미장(US)", "통합(KR+US)"], index=2)
+        st.subheader("필터 조합 저장")
+        save_name = st.text_input("저장 이름")
+        saved_keys = list(st.session_state["saved_filters"].keys())
+        loaded = st.selectbox("저장된 필터", ["선택 안함"] + saved_keys, index=0)
+        save_col, load_col, delete_col = st.columns(3)
+        with save_col:
+            save_clicked = st.button("저장")
+        with load_col:
+            load_clicked = loaded != "선택 안함" and st.button("불러오기")
+        with delete_col:
+            delete_clicked = loaded != "선택 안함" and st.button("삭제")
+        if load_clicked:
+            st.session_state["pending_filter_name"] = loaded
+            st.rerun()
+        if delete_clicked:
+            st.session_state["saved_filters"].pop(loaded, None)
+            save_saved_filters(st.session_state["saved_filters"])
+            if st.session_state.get("active_filter_name") == loaded:
+                st.session_state["active_filter"] = None
+                st.session_state["active_filter_name"] = ""
+            st.session_state["pending_filter_name"] = ""
+            st.success(f"삭제 완료: {loaded}")
+            st.rerun()
+
+        st.divider()
+        top_col1, top_col2 = st.columns([1.35, 1.35])
+        with top_col1:
+            market_mode = st.selectbox("시장 모드", ["국장(KR)", "미장(US)", "통합(KR+US)"], key="ui_market_mode")
+        with top_col2:
+            etf_mode = st.selectbox("ETF 모드", ["ETF 포함", "ETF 미포함", "ETF 만"], key="ui_etf_mode")
+        dividend_only = st.checkbox("배당만", key="ui_dividend_only")
+        dividend_cycles = st.multiselect("배당 주기", ["월배당", "분기배당", "반기배당", "연배당"], key="ui_dividend_cycles")
         if market_mode == "국장(KR)":
             markets = ["KR"]
         elif market_mode == "미장(US)":
@@ -2564,83 +2861,16 @@ def main() -> None:
             markets = ["KR", "US"]
         if market_mode == "통합(KR+US)":
             st.caption("권장: 국장/미장은 분리 스캔이 더 안정적입니다.")
-        etf_mode = st.selectbox("ETF 모드", ["전체", "ETF만", "ETF 제외"], index=0)
-        dividend_only = st.checkbox("배당만", value=False)
-        dividend_cycles = st.multiselect("배당 주기", ["월배당", "분기배당", "반기배당", "연배당"], default=[])
-
-        st.divider()
-        with st.expander("KRX Open API 설정", expanded=False):
-            st.markdown(
-                "KRX 키 발급: https://openapi.krx.co.kr\n\n"
-                "1) 회원가입/로그인\n"
-                "2) Open API 신청\n"
-                "3) 키 발급 후 아래에 입력/저장\n"
-                "4) 연결 테스트 확인"
-            )
-            if "krx_api_key" not in st.session_state:
-                st.session_state["krx_api_key"] = load_krx_api_key()
-            key_input = st.text_input("KRX API 키", value=st.session_state.get("krx_api_key", ""), type="password")
-            st.caption(f"저장된 키: {mask_key(st.session_state.get('krx_api_key', ''))}")
-            k1, k2, k3 = st.columns(3)
-            with k1:
-                if st.button("키 저장"):
-                    if save_krx_api_key(key_input):
-                        st.session_state["krx_api_key"] = key_input.strip()
-                        try:
-                            get_kr_universe.clear()
-                        except Exception:
-                            pass
-                        st.success("키 저장 완료")
-                    else:
-                        st.error("키 저장 실패")
-            with k2:
-                if st.button("연결 테스트"):
-                    ok, msg = test_krx_api_key(key_input)
-                    st.session_state["krx_api_test"] = msg
-                    if ok:
-                        st.success(msg)
-                    else:
-                        st.error(msg)
-            if st.button("KR 목록 캐시 새로고침"):
-                try:
-                    get_kr_universe.clear()
-                except Exception:
-                    pass
-                st.success("KR 목록 캐시를 초기화했습니다.")
-            with k3:
-                if st.button("키 삭제"):
-                    save_krx_api_key("")
-                    st.session_state["krx_api_key"] = ""
-                    try:
-                        get_kr_universe.clear()
-                    except Exception:
-                        pass
-                    st.success("키 삭제 완료")
-            if st.session_state.get("krx_api_test"):
-                st.caption(f"마지막 테스트: {st.session_state['krx_api_test']}")
-            st.divider()
-            st.caption("KR 종목 CSV 업로드 (종목코드/ticker 컬럼 필수)")
-            up = st.file_uploader("KR 시드 CSV", type=["csv"], key="kr_seed_upload")
-            if up is not None and st.button("KR CSV 저장"):
-                ok, msg = save_kr_seed_universe(up)
-                if ok:
-                    try:
-                        get_kr_universe.clear()
-                    except Exception:
-                        pass
-                    st.success(msg)
-                else:
-                    st.error(msg)
 
         st.divider()
         st.subheader("가격 범위 (KRW)")
         pcol1, pcol_mid, pcol2 = st.columns([1, 0.2, 1])
         with pcol1:
-            min_price_text = st.text_input("최소값", value="0")
+            min_price_text = st.text_input("최소값", key="ui_min_price_text")
         with pcol_mid:
             st.markdown("<div style='text-align:center; margin-top:30px;'>~</div>", unsafe_allow_html=True)
         with pcol2:
-            max_price_text = st.text_input("최대값 (0=무제한)", value="0")
+            max_price_text = st.text_input("최대값 (0=무제한)", key="ui_max_price_text")
 
         min_price = 0.0
         max_price = 0.0
@@ -2660,99 +2890,137 @@ def main() -> None:
 
         st.divider()
         st.subheader("일/주/월 이평 필터")
-        st.caption("각 이평선별로 패스 / > / < 선택 (데이터 없으면 자동 패스)")
+        st.caption("예전 구성처럼 위에서 아래로 빠르게 설정할 수 있게 유지하되, > / < 비교는 그대로 남겼습니다.")
         rule_options = ["패스", ">", "<"]
         tf_rule_map = {}
-
         st.markdown("일봉")
         d1, d2, d3 = st.columns(3)
         with d1:
-            tf_rule_map["D_20"] = st.selectbox("20MA", rule_options, index=0, key="rule_d20")
+            tf_rule_map["D_20"] = st.selectbox("20MA", rule_options, key="rule_d20")
         with d2:
-            tf_rule_map["D_60"] = st.selectbox("60MA", rule_options, index=0, key="rule_d60")
+            tf_rule_map["D_60"] = st.selectbox("60MA", rule_options, key="rule_d60")
         with d3:
-            tf_rule_map["D_120"] = st.selectbox("120MA", rule_options, index=0, key="rule_d120")
-
+            tf_rule_map["D_120"] = st.selectbox("120MA", rule_options, key="rule_d120")
         st.markdown("주봉")
         w1, w2, w3 = st.columns(3)
         with w1:
-            tf_rule_map["W_20"] = st.selectbox("20WMA", rule_options, index=0, key="rule_w20")
+            tf_rule_map["W_20"] = st.selectbox("20WMA", rule_options, key="rule_w20")
         with w2:
-            tf_rule_map["W_60"] = st.selectbox("60WMA", rule_options, index=0, key="rule_w60")
+            tf_rule_map["W_60"] = st.selectbox("60WMA", rule_options, key="rule_w60")
         with w3:
-            tf_rule_map["W_120"] = st.selectbox("120WMA", rule_options, index=0, key="rule_w120")
-
+            tf_rule_map["W_120"] = st.selectbox("120WMA", rule_options, key="rule_w120")
         st.markdown("월봉")
         m1, m2, m3 = st.columns(3)
         with m1:
-            tf_rule_map["M_20"] = st.selectbox("20MMA", rule_options, index=0, key="rule_m20")
+            tf_rule_map["M_20"] = st.selectbox("20MMA", rule_options, key="rule_m20")
         with m2:
-            tf_rule_map["M_60"] = st.selectbox("60MMA", rule_options, index=0, key="rule_m60")
+            tf_rule_map["M_60"] = st.selectbox("60MMA", rule_options, key="rule_m60")
         with m3:
-            tf_rule_map["M_120"] = st.selectbox("120MMA", rule_options, index=0, key="rule_m120")
+            tf_rule_map["M_120"] = st.selectbox("120MMA", rule_options, key="rule_m120")
 
         st.divider()
         st.subheader("기본 조건 필터")
-        preset = st.selectbox(
-            "프리셋",
-            [
-                "직접 선택",
-                "기본 필터 세트 (1~4)",
-                "장기추세+눌림목 (120+20)",
-                "강한상승 확인 (120+60)",
-                "단기가속 (20+5)",
-            ],
-            index=0,
-        )
-
-        condition_options = [
-            "1) 주가 > 120MA",
-            "2) 60MA 우상향",
-            "3) 20MA 눌림목",
-            "4) 거래량 증가",
-            "강한 상승 구조 (5>20>60>120)",
-            "일반 상승 구조 (20>60>120)",
-            "하락 구조 제외 (주가<120MA 제거)",
-            "단기 가속 (5MA>20MA)",
-            "중장기 강세 (60MA>120MA)",
-        ]
-
-        preset_map = {
-            "직접 선택": [],
-            "기본 필터 세트 (1~4)": [
-                "1) 주가 > 120MA",
-                "2) 60MA 우상향",
-                "3) 20MA 눌림목",
-                "4) 거래량 증가",
-            ],
-            "장기추세+눌림목 (120+20)": ["1) 주가 > 120MA", "3) 20MA 눌림목"],
-            "강한상승 확인 (120+60)": ["중장기 강세 (60MA>120MA)", "2) 60MA 우상향"],
-            "단기가속 (20+5)": ["단기 가속 (5MA>20MA)", "일반 상승 구조 (20>60>120)"],
-        }
-        selected_conditions = st.multiselect("적용 조건", condition_options, default=preset_map[preset])
+        selected_conditions = st.multiselect("조건 선택", condition_options, key="ui_selected_conditions")
 
         st.divider()
         st.subheader("재무 조건 필터")
         v1, v2 = st.columns(2)
         with v1:
-            per_max = st.number_input("PER 최대 (0=사용 안함)", min_value=0.0, value=0.0, step=1.0)
-            per_roe_max = st.number_input("PER/ROE 최대 (0=사용 안함)", min_value=0.0, value=0.0, step=0.1, format="%.2f")
+            per_max = st.number_input("PER 최대 (0=사용 안함)", min_value=0.0, step=1.0, key="ui_per_max")
+            per_roe_max = st.number_input("PER/ROE 최대 (0=사용 안함)", min_value=0.0, step=0.1, format="%.2f", key="ui_per_roe_max")
         with v2:
-            roe_min = st.number_input("ROE 최소 % (0=사용 안함)", min_value=0.0, value=0.0, step=1.0)
-            ev_to_ebitda_max = st.number_input("EV/EBITDA 최대 (0=사용 안함)", min_value=0.0, value=0.0, step=0.5, format="%.2f")
-        st.caption("재무 조건은 기술적 필터로 후보를 줄인 뒤 마지막 단계에서만 보강합니다.")
+            roe_min = st.number_input("ROE 최소 % (0=사용 안함)", min_value=0.0, step=1.0, key="ui_roe_min")
+            ev_to_ebitda_max = st.number_input("EV/EBITDA 최대 (0=사용 안함)", min_value=0.0, step=0.5, format="%.2f", key="ui_ev_to_ebitda_max")
+        st.caption("ROE, PER, PER/ROE, EV/EBITDA는 유지되고 있으며 기술적 필터 후 마지막 단계에서만 보강합니다.")
 
         st.divider()
         st.subheader("이평 근접도 필터")
-        near_tf_label = st.selectbox("근접도 기준 봉", ["사용 안함", "일봉", "주봉", "월봉"], index=0)
-        near_periods = st.multiselect("근접 체크 MA", [20, 60, 120], default=[])
-        near_pct = st.slider("근접 허용 오차(%)", 0.5, 20.0, 3.0, 0.5)
+        near_tf_label = st.selectbox("근접도 기준 봉", ["사용 안함", "일봉", "주봉", "월봉"], key="ui_near_tf_label")
+        near_periods = st.multiselect("근접 체크 MA", [20, 60, 120], key="ui_near_periods")
+        near_pct = st.slider("근접 허용 오차(%)", 0.5, 20.0, step=0.5, key="ui_near_pct")
 
         st.divider()
-        st.subheader("필터 조합 저장")
-        save_name = st.text_input("저장 이름")
-        if st.button("현재 필터 저장") and save_name.strip():
+        with st.expander("고급 옵션", expanded=False):
+            workers = st.slider("병렬 스레드 (권장 4~6)", 2, 12, 6, 1)
+            speed_mode = st.toggle("고속 모드 (기본 ON)", value=True, help="ON: 속도 우선, 일부 상세 정보 호출 최소화")
+            history_period = st.selectbox("조회 기간", ["2y", "3y", "5y"], index=0, help="고속 모드에서 짧을수록 빠름")
+            sector_scoring = st.toggle("섹터 강도 점수화", value=True, help="섹터별 52주 신고가 개수 기반 가점")
+            sector_pick_mode = st.selectbox("섹터 보강 대상", ["상위", "랜덤"], index=0)
+            sector_pick_label = st.selectbox("섹터 보강 개수", ["상위 50", "상위 100", "상위 200", "상위 400", "전체"], index=1)
+            sector_limit_map = {"상위 50": 50, "상위 100": 100, "상위 200": 200, "상위 400": 400, "전체": 0}
+            sector_fetch_limit = sector_limit_map.get(sector_pick_label, 100)
+            sector_workers = st.slider("섹터 수집 스레드", 1, 8, 4, 1)
+            sector_max_seconds = st.slider("섹터 수집 최대시간(초)", 30, 1800, 180, 30)
+            max_symbols = st.number_input("최대 스캔 수 (0=전체)", 0, 20000, 0, 100)
+
+        st.divider()
+        krx_status = "Y" if bool(st.session_state.get("krx_api_key", "").strip()) else "N"
+        with st.expander(f"KRX Open API 설정 [KEY:{krx_status}]", expanded=False):
+            key_input = st.text_input("KRX API 키", value=st.session_state.get("krx_api_key", ""), type="password")
+            st.caption(f"저장된 키: {mask_key(st.session_state.get('krx_api_key', ''))}")
+            k1, k2, k3 = st.columns(3)
+            with k1:
+                if st.button("키 저장"):
+                    if save_krx_api_key(key_input):
+                        st.session_state["krx_api_key"] = key_input.strip()
+                        try:
+                            get_kr_universe.clear()
+                        except Exception:
+                            pass
+                        st.success("키 저장 완료")
+                        st.rerun()
+                    else:
+                        st.error("키 저장 실패")
+            with k2:
+                if st.button("연결 테스트"):
+                    ok, msg = test_krx_api_key(key_input)
+                    st.session_state["krx_api_test"] = msg
+                    if ok:
+                        st.success(msg)
+                    else:
+                        st.error(msg)
+            with k3:
+                if st.button("키 삭제"):
+                    save_krx_api_key("")
+                    st.session_state["krx_api_key"] = ""
+                    try:
+                        get_kr_universe.clear()
+                    except Exception:
+                        pass
+                    st.success("키 삭제 완료")
+                    st.rerun()
+            if st.button("KR 목록 캐시 새로고침"):
+                try:
+                    get_kr_universe.clear()
+                except Exception:
+                    pass
+                st.success("KR 목록 캐시를 초기화했습니다.")
+            if st.button("KR ETF 캐시 새로고침"):
+                etf_universe = get_kr_etf_universe_ketf(force_refresh=True)
+                etf_meta = get_kr_etf_dividend_meta(force_refresh=True)
+                try:
+                    get_kr_universe.clear()
+                except Exception:
+                    pass
+                st.success(f"KR ETF 캐시 갱신 완료 (ETF {len(etf_universe):,}개 / 배당메타 {len(etf_meta):,}개)")
+            if st.session_state.get("krx_api_test"):
+                st.caption(f"마지막 테스트: {st.session_state['krx_api_test']}")
+            st.caption("KR 종목 CSV 업로드 (종목코드/ticker 컬럼 필수)")
+            up = st.file_uploader("KR 시드 CSV", type=["csv"], key="kr_seed_upload")
+            if up is not None and st.button("KR CSV 저장"):
+                ok, msg = save_kr_seed_universe(up)
+                if ok:
+                    try:
+                        get_kr_universe.clear()
+                    except Exception:
+                        pass
+                    st.success(msg)
+                else:
+                    st.error(msg)
+
+        if save_clicked and save_name.strip():
             st.session_state["saved_filters"][save_name.strip()] = {
+                "market_mode": market_mode,
                 "selected_conditions": selected_conditions,
                 "tf_rule_map": tf_rule_map,
                 "near_tf_label": near_tf_label,
@@ -2768,35 +3036,13 @@ def main() -> None:
                 "per_roe_max": per_roe_max,
                 "ev_to_ebitda_max": ev_to_ebitda_max,
             }
-            st.success(f"저장 완료: {save_name.strip()}")
-
-        saved_keys = list(st.session_state["saved_filters"].keys())
-        if saved_keys:
-            loaded = st.selectbox("저장된 필터", ["선택 안함"] + saved_keys, index=0)
-            if loaded != "선택 안함" and st.button("선택 필터 불러오기"):
-                st.session_state["active_filter"] = st.session_state["saved_filters"][loaded]
-                st.session_state["active_filter_name"] = loaded
-                st.success(f"저장 필터 '{loaded}' 적용됨")
-
-        st.divider()
-        with st.expander("고급 옵션", expanded=False):
-            workers = st.slider("병렬 스레드 (권장 4~6)", 2, 12, 6, 1)
-            speed_mode = st.toggle("고속 모드 (기본 ON)", value=True, help="ON: 속도 우선, 일부 상세 정보 호출 최소화")
-            history_period = st.selectbox("조회 기간", ["2y", "3y", "5y"], index=0, help="고속 모드에서 짧을수록 빠름")
-            sector_scoring = st.toggle("섹터 강도 점수화", value=True, help="섹터별 52주 신고가 개수 기반 가점")
-            sector_pick_mode = st.selectbox("섹터 보강 대상", ["상위", "랜덤"], index=0, help="상위: 현재 정렬 순서 기준 / 랜덤: 무작위")
-            sector_pick_label = st.selectbox("섹터 보강 개수", ["상위 50", "상위 100", "상위 200", "상위 400", "전체"], index=1)
-            sector_limit_map = {"상위 50": 50, "상위 100": 100, "상위 200": 200, "상위 400": 400, "전체": 0}
-            sector_fetch_limit = sector_limit_map.get(sector_pick_label, 100)
-            sector_workers = st.slider("섹터 수집 스레드", 1, 8, 4, 1)
-            sector_max_seconds = st.slider("섹터 수집 최대시간(초)", 30, 1800, 180, 30)
-            max_symbols = st.number_input("최대 스캔 수 (0=전체)", 0, 20000, 0, 100)
-            if st.button("KRX 연결 체크"):
-                ok, msg = check_krx_connection()
-                if ok:
-                    st.success(msg)
-                else:
-                    st.error(msg)
+            if save_saved_filters(st.session_state["saved_filters"]):
+                st.session_state["active_filter"] = st.session_state["saved_filters"][save_name.strip()]
+                st.session_state["active_filter_name"] = save_name.strip()
+                st.success(f"저장 완료: {save_name.strip()}")
+                st.rerun()
+            else:
+                st.warning("세션에는 저장됐지만 파일 저장에는 실패했습니다.")
 
     active_cfg = st.session_state.get("active_filter")
     if active_cfg:
@@ -2864,7 +3110,7 @@ def main() -> None:
     kr_source = (kr_df["_source"].value_counts().index[0] if (not kr_df.empty and "_source" in kr_df.columns) else "none")
     st.caption(f"목록 소스: US={us_source}, KR={kr_source}")
     force_exclusion_notice = st.empty()
-    force_exclusion_notice.info("강제 제외: SPAC / ETN / 저유동성 / 거래불가 / 우선주류 / 초저가 / 신규상장")
+    force_exclusion_notice.info("강제 제외: SPAC / ETN / 레버리지ETF / 인버스ETF / 싱글스톡ETF / 워런트·Rights / 저유동성 / 거래불가 / 우선주류 / 초저가 / 신규상장")
     diag_col1, diag_col2 = st.columns(2)
     with diag_col1:
         if st.button("실행 전 KRX 상태 확인"):
@@ -2885,14 +3131,14 @@ def main() -> None:
         started = datetime.now()
         pipeline_t0 = time.time()
 
-        run_selected_conditions = active_cfg["selected_conditions"] if active_cfg else selected_conditions
+        run_selected_conditions = list(active_cfg.get("selected_conditions", [])) if active_cfg else selected_conditions
         run_tf_rule_map = active_cfg.get("tf_rule_map", {}) if active_cfg else tf_rule_map
-        run_near_tf_label = active_cfg["near_tf_label"] if active_cfg else near_tf_label
-        run_near_periods = active_cfg["near_periods"] if active_cfg else near_periods
-        run_near_pct = active_cfg["near_pct"] if active_cfg else near_pct
-        run_min_price = active_cfg["min_price"] if active_cfg else min_price
-        run_max_price = active_cfg["max_price"] if active_cfg else max_price
-        run_etf_mode = active_cfg["etf_mode"] if active_cfg else etf_mode
+        run_near_tf_label = active_cfg.get("near_tf_label", "사용 안함") if active_cfg else near_tf_label
+        run_near_periods = active_cfg.get("near_periods", []) if active_cfg else near_periods
+        run_near_pct = float(active_cfg.get("near_pct", 3.0)) if active_cfg else near_pct
+        run_min_price = float(active_cfg.get("min_price", 0.0)) if active_cfg else min_price
+        run_max_price = float(active_cfg.get("max_price", 0.0)) if active_cfg else max_price
+        run_etf_mode = active_cfg.get("etf_mode", etf_mode) if active_cfg else etf_mode
         run_dividend_only = bool(active_cfg.get("dividend_only", False)) if active_cfg else bool(dividend_only)
         run_dividend_cycles = list(active_cfg.get("dividend_cycles", [])) if active_cfg else list(dividend_cycles)
         run_per_max = float(active_cfg.get("per_max", 0.0)) if active_cfg else float(per_max)
@@ -2909,13 +3155,25 @@ def main() -> None:
         if run_history_period != history_period:
             st.info(f"선택한 장기 이평 조건으로 조회 기간을 자동 확장했습니다: {history_period} -> {run_history_period}")
 
-        # Speed-up: prefilter target list before API calls where possible.
-        fast_universe = prefilter_universe_fast(
-            universe,
-            run_etf_mode,
+        filter_ctx = build_filter_context(
+            min_price=run_min_price,
+            max_price=run_max_price,
+            etf_mode=run_etf_mode,
             dividend_only=run_dividend_only,
             dividend_cycles=run_dividend_cycles,
+            tf_rule_map=run_tf_rule_map,
+            near_tf_label=run_near_tf_label,
+            near_periods=run_near_periods,
+            near_pct=run_near_pct,
         )
+        fast_universe, prefilter_counts = apply_prefilter_pipeline(universe, filter_ctx)
+        scan_stats_prefilter = {
+            "prefilter_input_count": float(prefilter_counts.get("pre_input", len(universe))),
+            "prefilter_etf_count": float(prefilter_counts.get("pre_etf", len(fast_universe))),
+            "prefilter_dividend_cycle_count": float(prefilter_counts.get("pre_dividend_cycle", len(fast_universe))),
+            "prefilter_dividend_only_count": float(prefilter_counts.get("pre_dividend_only", len(fast_universe))),
+            "prefilter_price_count": float(prefilter_counts.get("pre_price", len(fast_universe))),
+        }
         if len(fast_universe) > 1500 and run_workers > 6:
             run_workers = 6
             st.info("대규모 스캔에서 Render 응답성과 429 완화를 위해 병렬 스레드를 6으로 자동 조정했습니다.")
@@ -2926,6 +3184,7 @@ def main() -> None:
             fetch_info=run_fetch_info,
             history_period=run_history_period,
         )
+        scan_stats.update(scan_stats_prefilter)
         scan_stats["t_scan_sec"] = round(time.time() - pipeline_t0, 2)
         sector_stats = {}
         if sector_scoring and not raw.empty:
@@ -3042,10 +3301,16 @@ def main() -> None:
         filtered["20일평균거래대금(억원)"] = pd.to_numeric(filtered.get("avg_traded_value_krw_20"), errors="coerce").apply(_to_eok)
         if "score" not in filtered.columns:
             filtered["score"] = pd.Series([0.0] * len(filtered), index=filtered.index, dtype=float)
+        if "priority_bucket" not in filtered.columns:
+            filtered["priority_bucket"] = pd.Series([0.0] * len(filtered), index=filtered.index, dtype=float)
         if "dividend_yield_pct" not in filtered.columns:
             filtered["dividend_yield_pct"] = pd.Series([0.0] * len(filtered), index=filtered.index, dtype=float)
         t_sort0 = time.time()
-        filtered = filtered.sort_values(["score", "dividend_yield_pct"], ascending=[False, False], na_position="last")
+        filtered = filtered.sort_values(
+            ["priority_bucket", "score", "dividend_yield_pct", "roe_pct"],
+            ascending=[False, False, False, False],
+            na_position="last",
+        )
         scan_stats["t_sort_sec"] = round(time.time() - t_sort0, 2)
         scan_stats["final_us_count"] = float((filtered["market"] == "US").sum()) if "market" in filtered.columns else 0.0
         scan_stats["final_kr_count"] = float((filtered["market"] == "KR").sum()) if "market" in filtered.columns else 0.0
@@ -3091,7 +3356,7 @@ def main() -> None:
             view["현재가(KRW)표시"] = pd.to_numeric(view["price_krw"], errors="coerce").map(lambda v: f"{v:,.2f}" if pd.notna(v) else "-")
             view["20일평균거래대금(억원)표시"] = pd.to_numeric(view["20일평균거래대금(억원)"], errors="coerce").map(lambda v: f"{v:,.2f}" if pd.notna(v) else "-")
             cols = [
-                "score", "market", "ticker", "name", "가격표시", "현재가(KRW)표시", "20일평균거래대금(억원)표시", "dividend_yield_pct", "dividend_cycle",
+                "priority_bucket", "score", "market", "ticker", "name", "가격표시", "현재가(KRW)표시", "20일평균거래대금(억원)표시", "dividend_yield_pct", "dividend_cycle",
                 "per", "roe_pct", "per_roe_ratio", "ev_to_ebitda",
                 "sector", "sector_strength_score", "sector_new_high_count", "sector_new_high_ratio",
                 "D_ma20", "D_ma60", "D_ma120", "W_ma20", "W_ma60", "W_ma120", "M_ma20", "M_ma60", "M_ma120",
@@ -3100,6 +3365,7 @@ def main() -> None:
             ]
             safe_cols = [c for c in cols if c in view.columns]
             rename_map = {
+                "priority_bucket": "우선순위",
                 "score": "점수",
                 "market": "시장",
                 "ticker": "티커",
