@@ -18,7 +18,10 @@ except Exception:
     pass
 import yfinance as yf
 import yfinance.cache as yf_cache
-from pykrx import stock as pykrx_stock
+try:
+    from pykrx import stock as pykrx_stock
+except Exception:
+    pykrx_stock = None
 try:
     import FinanceDataReader as fdr
 except Exception:
@@ -783,6 +786,8 @@ def get_us_universe() -> pd.DataFrame:
 
 
 def _safe_kr_tickers(market: str) -> List[str]:
+    if pykrx_stock is None:
+        return []
     try:
         out = pykrx_stock.get_market_ticker_list(market=market)
         if out:
@@ -803,6 +808,8 @@ def _safe_kr_tickers(market: str) -> List[str]:
 
 
 def _nearest_krx_date() -> Optional[str]:
+    if pykrx_stock is None:
+        return None
     base = datetime.now()
     for d in range(0, 15):
         dt = (base - timedelta(days=d)).strftime("%Y%m%d")
@@ -822,6 +829,8 @@ def enrich_kr_fundamentals(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, fl
     out = df.copy()
     kr_mask = out["market"].astype(str).str.upper().eq("KR")
     if kr_mask.sum() == 0:
+        return out, {"kr_fund_div_filled": 0.0, "kr_per_filled": 0.0, "kr_roe_filled": 0.0, "kr_per_roe_filled": 0.0}
+    if pykrx_stock is None:
         return out, {"kr_fund_div_filled": 0.0, "kr_per_filled": 0.0, "kr_roe_filled": 0.0, "kr_per_roe_filled": 0.0}
 
     before_div = int(pd.to_numeric(out.loc[kr_mask, "dividend_yield_pct"], errors="coerce").notna().sum())
@@ -1382,6 +1391,8 @@ def _period_to_days(period: str) -> int:
 
 
 def _fetch_kr_history_pykrx(ticker: str, history_period: str) -> pd.DataFrame:
+    if pykrx_stock is None:
+        return pd.DataFrame()
     tk = "".join(ch for ch in str(ticker) if ch.isdigit()).zfill(6)
     if tk == "000000":
         return pd.DataFrame()
@@ -1422,6 +1433,11 @@ def _fetch_kr_history_pykrx(ticker: str, history_period: str) -> pd.DataFrame:
 def _compute_metrics(item: Dict, fx: Optional[float], fetch_info: bool = True, history_period: str = "5y") -> Optional[Dict]:
     if str(item.get("market", "")).upper() == "KR":
         hist = _fetch_kr_history_pykrx(item.get("ticker", ""), history_period)
+        if hist.empty and item.get("yf_ticker"):
+            try:
+                hist = yf.Ticker(str(item.get("yf_ticker"))).history(period=history_period, interval="1d", auto_adjust=False, actions=True)
+            except Exception:
+                hist = pd.DataFrame()
         return _build_metrics_from_history(item, hist, fx, info={})
 
     tk = yf.Ticker(item["yf_ticker"])
