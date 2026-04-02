@@ -73,6 +73,8 @@ FALLBACK_KR_TICKERS = [
 CACHE_DIR = Path(__file__).resolve().parent / "_cache"
 US_CACHE_PATH = CACHE_DIR / "us_universe.csv"
 KR_CACHE_PATH = CACHE_DIR / "kr_universe.csv"
+KR_ETF_CACHE_PATH = CACHE_DIR / "kr_etf_universe.csv"
+KR_ETF_DIVIDEND_META_PATH = CACHE_DIR / "kr_etf_dividend_meta.csv"
 SECTOR_CACHE_PATH = CACHE_DIR / "sector_cache.csv"
 SECTOR_SEED_PATH = CACHE_DIR / "sector_seed.csv"
 KRX_KEY_PATH = CACHE_DIR / "krx_api_key.txt"
@@ -85,6 +87,8 @@ KRX_OPENAPI_ENDPOINTS = [
     ("KOSDAQ", "https://data.krx.co.kr/svc/apis/sto/ksq_bydd_trd"),
     ("KONEX", "https://data.krx.co.kr/svc/apis/sto/knx_bydd_trd"),
 ]
+KETF_LINEUP_URL = "https://www.k-etf.com/api/v0/lineup/etf/in/market_temp?code=XKRX&lang=ko"
+KETF_DIVIDEND_RANK_URL = "https://www.k-etf.com/api/v0/performance/etf/orderby/dividend?market=XKRX&limit={limit}&lang=ko"
 try:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     yf.set_tz_cache_location(str(CACHE_DIR / "yf_tz_cache"))
@@ -165,6 +169,151 @@ def load_universe_cache(path: Path) -> pd.DataFrame:
     except Exception:
         pass
     return pd.DataFrame()
+
+
+def _is_cache_fresh(path: Path, max_age_hours: int) -> bool:
+    try:
+        if not path.exists():
+            return False
+        age_sec = time.time() - path.stat().st_mtime
+        return age_sec <= max_age_hours * 3600
+    except Exception:
+        return False
+
+
+def _classify_dividend_cycle_from_summary(count: Optional[float], begin: Optional[int], last: Optional[int]) -> Optional[str]:
+    try:
+        cnt = int(float(count or 0))
+        if cnt <= 0:
+            return None
+        if cnt >= 10:
+            return "월배당"
+        if cnt >= 4:
+            return "분기배당"
+        if cnt == 2:
+            return "반기배당"
+        if cnt == 1:
+            return "연배당"
+        if begin and last:
+            b = datetime.strptime(str(int(begin)), "%Y%m%d").date()
+            l = datetime.strptime(str(int(last)), "%Y%m%d").date()
+            span_days = max(1, (l - b).days)
+            avg_gap = span_days / max(1, cnt - 1) if cnt > 1 else span_days
+            if avg_gap <= 45:
+                return "월배당"
+            if avg_gap <= 130:
+                return "분기배당"
+            if avg_gap <= 230:
+                return "반기배당"
+        return "연배당"
+    except Exception:
+        return None
+
+
+def get_kr_etf_universe_ketf(force_refresh: bool = False) -> pd.DataFrame:
+    if not force_refresh:
+        cached = load_universe_cache(KR_ETF_CACHE_PATH)
+        if not cached.empty and _is_cache_fresh(KR_ETF_CACHE_PATH, 24):
+            return cached
+    try:
+        r = requests.get(KETF_LINEUP_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        js = r.json()
+        rows: List[Dict] = []
+        if isinstance(js, list):
+            for it in js:
+                code = str((it or {}).get("code", "")).strip().upper()
+                name = str((it or {}).get("name", "")).strip()
+                if not code or len(code) < 6:
+                    continue
+                ticker = code[-6:]
+                rows.append(
+                    {
+                        "market": "KR",
+                        "ticker": ticker,
+                        "yf_ticker": f"{ticker}.KS",
+                        "name": name,
+                        "currency": "KRW",
+                        "_source": "k_etf",
+                        "is_etf_hint": True,
+                    }
+                )
+        out = pd.DataFrame(rows).drop_duplicates(subset=["ticker"]).reset_index(drop=True)
+        if not out.empty:
+            save_universe_cache(out, KR_ETF_CACHE_PATH)
+        return out
+    except Exception:
+        return load_universe_cache(KR_ETF_CACHE_PATH)
+
+
+def get_kr_etf_dividend_meta(force_refresh: bool = False, limit: int = 2000) -> pd.DataFrame:
+    if not force_refresh:
+        cached = load_universe_cache(KR_ETF_DIVIDEND_META_PATH)
+        if not cached.empty and _is_cache_fresh(KR_ETF_DIVIDEND_META_PATH, 24):
+            return cached
+    try:
+        url = KETF_DIVIDEND_RANK_URL.format(limit=max(500, int(limit)))
+        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        js = r.json()
+        rows: List[Dict] = []
+        if isinstance(js, list):
+            for it in js:
+                code = str((it or {}).get("code", "")).strip().upper()
+                meta = (it or {}).get("dict") or {}
+                if not code or not isinstance(meta, dict):
+                    continue
+                ticker = code[-6:]
+                div_cycle = _classify_dividend_cycle_from_summary(meta.get("count"), meta.get("begin"), meta.get("last"))
+                rows.append(
+                    {
+                        "ticker": ticker,
+                        "dividend_cycle": div_cycle,
+                        "dividend_event_count": int(float(meta.get("count", 0) or 0)),
+                        "dividend_sum": float(meta.get("sum", 0.0) or 0.0),
+                        "dividend_begin": meta.get("begin"),
+                        "dividend_last": meta.get("last"),
+                        "is_dividend": bool(float(meta.get("sum", 0.0) or 0.0) > 0),
+                        "_source": "k_etf_dividend_rank",
+                    }
+                )
+        out = pd.DataFrame(rows).drop_duplicates(subset=["ticker"]).reset_index(drop=True)
+        if not out.empty:
+            save_universe_cache(out, KR_ETF_DIVIDEND_META_PATH)
+        return out
+    except Exception:
+        return load_universe_cache(KR_ETF_DIVIDEND_META_PATH)
+
+
+def merge_kr_etf_universe(base_df: pd.DataFrame) -> pd.DataFrame:
+    etf_df = get_kr_etf_universe_ketf()
+    if etf_df.empty:
+        return base_df if isinstance(base_df, pd.DataFrame) else pd.DataFrame()
+    meta_df = get_kr_etf_dividend_meta()
+    merged_etf = etf_df.copy()
+    if not meta_df.empty:
+        merged_etf = merged_etf.merge(meta_df, on="ticker", how="left")
+    if base_df is None or base_df.empty:
+        return merged_etf.drop_duplicates(subset=["ticker"]).reset_index(drop=True)
+    out = base_df.copy()
+    if "is_etf_hint" not in out.columns:
+        out["is_etf_hint"] = pd.NA
+    if "dividend_cycle" not in out.columns:
+        out["dividend_cycle"] = None
+    if "is_dividend" not in out.columns:
+        out["is_dividend"] = pd.NA
+    out = pd.concat([out, merged_etf], ignore_index=True)
+    out = out.drop_duplicates(subset=["ticker"], keep="last").reset_index(drop=True)
+    return out
+
+
+def _finalize_kr_universe(df: pd.DataFrame) -> pd.DataFrame:
+    out = merge_kr_etf_universe(df)
+    if out is None:
+        return pd.DataFrame()
+    if not out.empty:
+        save_universe_cache(out, KR_CACHE_PATH)
+    return out.reset_index(drop=True)
 
 
 def load_sector_cache() -> pd.DataFrame:
@@ -949,8 +1098,7 @@ def get_kr_universe(key_hint: str = "") -> pd.DataFrame:
     if key:
         openapi_df = get_kr_universe_from_openapi(key)
         if not openapi_df.empty:
-            save_universe_cache(openapi_df, KR_CACHE_PATH)
-            return openapi_df
+            return _finalize_kr_universe(openapi_df)
 
     rows: List[Dict] = []
     for market, suffix in [("KOSPI", ".KS"), ("KOSDAQ", ".KQ"), ("KONEX", ".KQ")]:
@@ -963,12 +1111,10 @@ def get_kr_universe(key_hint: str = "") -> pd.DataFrame:
             rows.append({"market": "KR", "ticker": t, "yf_ticker": f"{t}{suffix}", "name": n, "currency": "KRW", "_source": "pykrx"})
     out = pd.DataFrame(rows).drop_duplicates(subset=["ticker"]).reset_index(drop=True)
     if not out.empty:
-        save_universe_cache(out, KR_CACHE_PATH)
-        return out
+        return _finalize_kr_universe(out)
     finder_df = get_kr_universe_from_krx_finder()
     if not finder_df.empty:
-        save_universe_cache(finder_df, KR_CACHE_PATH)
-        return finder_df
+        return _finalize_kr_universe(finder_df)
     # Fallback path for KRX 403 / pykrx upstream instability.
     if fdr is not None:
         try:
@@ -997,18 +1143,15 @@ def get_kr_universe(key_hint: str = "") -> pd.DataFrame:
                     })
                 fallback = pd.DataFrame(frows).drop_duplicates(subset=["ticker"]).reset_index(drop=True)
                 if not fallback.empty:
-                    save_universe_cache(fallback, KR_CACHE_PATH)
-                    return fallback
+                    return _finalize_kr_universe(fallback)
         except Exception:
             pass
     kind_df = get_kr_universe_from_kind()
     if not kind_df.empty:
-        save_universe_cache(kind_df, KR_CACHE_PATH)
-        return kind_df
+        return _finalize_kr_universe(kind_df)
     seed_csv = load_kr_seed_universe()
     if not seed_csv.empty:
-        save_universe_cache(seed_csv, KR_CACHE_PATH)
-        return seed_csv
+        return _finalize_kr_universe(seed_csv)
 
     cached = load_universe_cache(KR_CACHE_PATH)
     if not cached.empty:
@@ -1016,13 +1159,12 @@ def get_kr_universe(key_hint: str = "") -> pd.DataFrame:
             cached["_source"] = "cache_kr"
         else:
             cached["_source"] = "cache_kr"
-        return cached
+        return merge_kr_etf_universe(cached)
     seeded = kr_universe_from_seed(limit=3000)
     if not seeded.empty:
-        save_universe_cache(seeded, KR_CACHE_PATH)
-        return seeded
+        return _finalize_kr_universe(seeded)
     # Last fallback: small KR sample so KR-only mode remains usable.
-    return fallback_kr_universe()
+    return _finalize_kr_universe(fallback_kr_universe())
 
 
 def diagnose_kr_sources(key_hint: str = "") -> List[Dict[str, str]]:
@@ -1068,6 +1210,16 @@ def _safe_float(v) -> Optional[float]:
         return float(v)
     except Exception:
         return None
+
+
+def _as_bool(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    if isinstance(v, (int, float)):
+        return bool(v)
+    return str(v).strip().lower() in {"1", "true", "t", "yes", "y"}
 
 
 def _normalize_dividend_yield_pct(v, annual_dividend_rate=None, price=None) -> Optional[float]:
@@ -1168,6 +1320,31 @@ def _slope_up(series: pd.Series, n: int) -> Optional[bool]:
     return now > prev
 
 
+def _classify_dividend_cycle(divs: pd.Series) -> Optional[str]:
+    if divs is None or divs.empty:
+        return None
+    try:
+        events = divs[divs > 0].dropna()
+        if events.empty:
+            return None
+        idx = pd.Series(pd.to_datetime(events.index, errors="coerce")).dropna().drop_duplicates().sort_values()
+        if len(idx) <= 1:
+            return "연배당"
+        gaps = idx.diff().dt.days.dropna()
+        if gaps.empty:
+            return "연배당"
+        med = float(gaps.median())
+        if med <= 45:
+            return "월배당"
+        if med <= 130:
+            return "분기배당"
+        if med <= 230:
+            return "반기배당"
+        return "연배당"
+    except Exception:
+        return None
+
+
 def _build_metrics_from_history(item: Dict, hist: pd.DataFrame, fx: Optional[float], info: Optional[Dict] = None) -> Optional[Dict]:
     info = info or {}
     if hist.empty or "Close" not in hist.columns:
@@ -1194,6 +1371,16 @@ def _build_metrics_from_history(item: Dict, hist: pd.DataFrame, fx: Optional[flo
     info_price = _safe_float(info.get("currentPrice"))
     if info_price is None:
         info_price = _safe_float(info.get("regularMarketPrice"))
+    div_cycle = str(item.get("dividend_cycle", "")).strip() or None
+    divs = pd.Series(dtype=float)
+    if "Dividends" in hist.columns:
+        try:
+            divs = pd.to_numeric(hist["Dividends"], errors="coerce")
+            hist_div_cycle = _classify_dividend_cycle(divs)
+            if hist_div_cycle:
+                div_cycle = hist_div_cycle
+        except Exception:
+            divs = pd.Series(dtype=float)
     dy = _normalize_dividend_yield_pct(
         info.get("dividendYield"),
         annual_dividend_rate=info_div_rate,
@@ -1202,14 +1389,16 @@ def _build_metrics_from_history(item: Dict, hist: pd.DataFrame, fx: Optional[flo
     # Fast-mode fallback: compute dividend yield from downloaded price actions.
     if dy is None and "Dividends" in hist.columns:
         try:
-            divs = pd.to_numeric(hist["Dividends"], errors="coerce").dropna()
-            if not divs.empty:
-                recent = divs.tail(min(len(divs), 252))
+            non_null_divs = divs.dropna()
+            if not non_null_divs.empty:
+                recent = non_null_divs.tail(min(len(non_null_divs), 252))
                 annual_div = float(recent.sum())
                 if price > 0 and annual_div > 0:
                     dy = (annual_div / price) * 100.0
         except Exception:
             pass
+    if div_cycle is None and str(item.get("market", "")).upper() == "KR" and dy is not None and dy > 0:
+        div_cycle = "연배당"
 
     traded_value = None
     if len(close) >= 20 and len(vol) >= 20:
@@ -1229,6 +1418,7 @@ def _build_metrics_from_history(item: Dict, hist: pd.DataFrame, fx: Optional[flo
     name_text = f"{item['name']} {str(info.get('shortName', ''))} {str(info.get('longName', ''))}".upper()
     quote_type = str(info.get("quoteType", "")).upper()
     ticker = str(item["ticker"]).upper()
+    etf_hint = _as_bool(item.get("is_etf_hint", False))
 
     is_spac = (
         ("SPAC" in name_text)
@@ -1237,7 +1427,7 @@ def _build_metrics_from_history(item: Dict, hist: pd.DataFrame, fx: Optional[flo
         or ("기업인수목적" in item["name"])
     )
     is_etn = ("ETN" in name_text) or ("ETN" in quote_type) or ("EXCHANGE TRADED NOTE" in name_text)
-    is_etf = ("ETF" in name_text) or ("ETF" in quote_type) or (quote_type == "ETF")
+    is_etf = etf_hint or ("ETF" in name_text) or ("ETF" in quote_type) or (quote_type == "ETF")
 
     is_preferred_like = ticker.endswith(("W", "R", "U")) or ("PREFERRED" in name_text) or (" 우" in name_text) or ("우B" in name_text)
     is_untradeable = (info.get("tradeable") is False) or (vol_last == 0)
@@ -1282,6 +1472,8 @@ def _build_metrics_from_history(item: Dict, hist: pd.DataFrame, fx: Optional[flo
         "price": round(price, 4),
         "price_krw": round(price_krw, 2) if price_krw is not None else None,
         "dividend_yield_pct": round(dy, 4) if dy is not None else None,
+        "dividend_cycle": div_cycle,
+        "is_dividend": _as_bool(item.get("is_dividend", False)) or bool((dy is not None) and (dy > 0)) or (div_cycle is not None),
         "avg_traded_value_krw_20": round(traded_value_krw, 2) if traded_value_krw is not None else None,
         "per": round(per, 4) if per is not None else None,
         "roe_pct": round(roe_pct, 4) if roe_pct is not None else None,
@@ -2136,17 +2328,37 @@ def run_scan(
     return pd.DataFrame(rows), stats
 
 
-def prefilter_universe_fast(universe: pd.DataFrame, etf_mode: str) -> pd.DataFrame:
+def prefilter_universe_fast(
+    universe: pd.DataFrame,
+    etf_mode: str,
+    dividend_only: bool = False,
+    dividend_cycles: Optional[List[str]] = None,
+) -> pd.DataFrame:
     # Cheap string-based prefilter before network-heavy yfinance calls.
     if universe.empty:
         return universe
+    out = universe.copy()
+    selected_cycles = [str(x).strip() for x in (dividend_cycles or []) if str(x).strip()]
+    name_series = out["name"].fillna("").str.upper()
+    etf_hint = pd.Series(False, index=out.index)
+    if "is_etf_hint" in out.columns:
+        etf_hint = out["is_etf_hint"].fillna("").astype(str).str.strip().str.lower().isin(["1", "true", "t", "yes", "y"])
+    etf_like = name_series.str.contains("ETF", regex=False) | etf_hint
     if etf_mode == "전체":
-        return universe
-    name_series = universe["name"].fillna("").str.upper()
-    etf_like = name_series.str.contains("ETF", regex=False)
-    if etf_mode == "ETF만":
-        return universe[etf_like]
-    return universe[~etf_like]
+        pass
+    elif etf_mode == "ETF만":
+        out = out[etf_like]
+    else:
+        out = out[~etf_like]
+    if dividend_only and "is_dividend" in out.columns:
+        known_div = out["is_dividend"].notna()
+        div_true = out["is_dividend"].fillna("").astype(str).str.strip().str.lower().isin(["1", "true", "t", "yes", "y"])
+        out = out[~known_div | div_true]
+    if selected_cycles and "dividend_cycle" in out.columns:
+        cycle = out["dividend_cycle"].fillna("").astype(str).str.strip()
+        known_cycle = cycle.ne("")
+        out = out[~known_cycle | cycle.isin(selected_cycles)]
+    return out
 
 
 def apply_hard_exclusions(df: pd.DataFrame) -> pd.DataFrame:
@@ -2171,6 +2383,25 @@ def apply_etf_mode(df: pd.DataFrame, mode: str) -> pd.DataFrame:
     if mode == "ETF 제외":
         return df[df["is_etf"] == False]
     return df
+
+
+def apply_dividend_filter(df: pd.DataFrame, dividend_only: bool, dividend_cycles: List[str]) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    dy = _numeric_series(out, "dividend_yield_pct")
+    cycle = out.get("dividend_cycle")
+    has_cycle = cycle.notna() if isinstance(cycle, pd.Series) else pd.Series(False, index=out.index)
+    has_div_flag = pd.Series(False, index=out.index)
+    if "is_dividend" in out.columns:
+        has_div_flag = out["is_dividend"].fillna("").astype(str).str.strip().str.lower().isin(["1", "true", "t", "yes", "y"])
+    has_div = (dy > 0).fillna(False) | has_cycle | has_div_flag
+    if dividend_only:
+        out = out[has_div]
+    selected_cycles = [str(x).strip() for x in dividend_cycles if str(x).strip()]
+    if selected_cycles and "dividend_cycle" in out.columns:
+        out = out[out["dividend_cycle"].isin(selected_cycles)]
+    return out
 
 
 def apply_valuation_filters(
@@ -2334,6 +2565,8 @@ def main() -> None:
         if market_mode == "통합(KR+US)":
             st.caption("권장: 국장/미장은 분리 스캔이 더 안정적입니다.")
         etf_mode = st.selectbox("ETF 모드", ["전체", "ETF만", "ETF 제외"], index=0)
+        dividend_only = st.checkbox("배당만", value=False)
+        dividend_cycles = st.multiselect("배당 주기", ["월배당", "분기배당", "반기배당", "연배당"], default=[])
 
         st.divider()
         with st.expander("KRX Open API 설정", expanded=False):
@@ -2528,6 +2761,8 @@ def main() -> None:
                 "min_price": min_price,
                 "max_price": max_price,
                 "etf_mode": etf_mode,
+                "dividend_only": dividend_only,
+                "dividend_cycles": dividend_cycles,
                 "per_max": per_max,
                 "roe_min": roe_min,
                 "per_roe_max": per_roe_max,
@@ -2658,10 +2893,13 @@ def main() -> None:
         run_min_price = active_cfg["min_price"] if active_cfg else min_price
         run_max_price = active_cfg["max_price"] if active_cfg else max_price
         run_etf_mode = active_cfg["etf_mode"] if active_cfg else etf_mode
+        run_dividend_only = bool(active_cfg.get("dividend_only", False)) if active_cfg else bool(dividend_only)
+        run_dividend_cycles = list(active_cfg.get("dividend_cycles", [])) if active_cfg else list(dividend_cycles)
         run_per_max = float(active_cfg.get("per_max", 0.0)) if active_cfg else float(per_max)
         run_roe_min = float(active_cfg.get("roe_min", 0.0)) if active_cfg else float(roe_min)
         run_per_roe_max = float(active_cfg.get("per_roe_max", 0.0)) if active_cfg else float(per_roe_max)
         run_ev_to_ebitda_max = float(active_cfg.get("ev_to_ebitda_max", 0.0)) if active_cfg else float(ev_to_ebitda_max)
+        dividend_filter_active = bool(run_dividend_only or run_dividend_cycles)
         valuation_active = any(v > 0 for v in [run_per_max, run_roe_min, run_per_roe_max, run_ev_to_ebitda_max])
         run_workers = workers
         run_fetch_info = not speed_mode
@@ -2672,7 +2910,12 @@ def main() -> None:
             st.info(f"선택한 장기 이평 조건으로 조회 기간을 자동 확장했습니다: {history_period} -> {run_history_period}")
 
         # Speed-up: prefilter target list before API calls where possible.
-        fast_universe = prefilter_universe_fast(universe, run_etf_mode)
+        fast_universe = prefilter_universe_fast(
+            universe,
+            run_etf_mode,
+            dividend_only=run_dividend_only,
+            dividend_cycles=run_dividend_cycles,
+        )
         if len(fast_universe) > 1500 and run_workers > 6:
             run_workers = 6
             st.info("대규모 스캔에서 Render 응답성과 429 완화를 위해 병렬 스레드를 6으로 자동 조정했습니다.")
@@ -2727,6 +2970,9 @@ def main() -> None:
 
         filtered = apply_hard_exclusions(filtered)
         post_hard = len(filtered)
+
+        filtered = apply_dividend_filter(filtered, run_dividend_only, run_dividend_cycles)
+        post_dividend = len(filtered)
 
         filtered = apply_condition_list(filtered, run_selected_conditions)
         post_basic = len(filtered)
@@ -2810,10 +3056,11 @@ def main() -> None:
         st.session_state["last_saved_csv_message"] = csv_msg
 
         elapsed = datetime.now() - started
+        dividend_segment = f" -> 배당 {post_dividend:,}" if dividend_filter_active else ""
         value_segment = f" -> 재무조건 {post_value:,}" if valuation_active else ""
         st.success(
             f"{pre:,} -> 가격 {post_price:,} -> ETF {post_etf:,} -> 강제제외 {post_hard:,} "
-            f"-> 기본조건 {post_basic:,} -> 봉이평 {post_tf:,} -> 근접도 {post_near:,}{value_segment} -> 최종 {len(filtered):,} "
+            f"{dividend_segment} -> 기본조건 {post_basic:,} -> 봉이평 {post_tf:,} -> 근접도 {post_near:,}{value_segment} -> 최종 {len(filtered):,} "
             f"(소요 {str(elapsed).split('.')[0]})"
         )
         if len(filtered) == 0:
@@ -2821,7 +3068,7 @@ def main() -> None:
         st.session_state["last_filtered"] = filtered.copy()
         st.session_state["last_summary"] = (
             f"{pre:,} -> 가격 {post_price:,} -> ETF {post_etf:,} -> 강제제외 {post_hard:,} "
-            f"-> 기본조건 {post_basic:,} -> 봉이평 {post_tf:,} -> 근접도 {post_near:,}{value_segment} -> 최종 {len(filtered):,} "
+            f"{dividend_segment} -> 기본조건 {post_basic:,} -> 봉이평 {post_tf:,} -> 근접도 {post_near:,}{value_segment} -> 최종 {len(filtered):,} "
             f"(소요 {str(elapsed).split('.')[0]})"
         )
 
@@ -2844,7 +3091,7 @@ def main() -> None:
             view["현재가(KRW)표시"] = pd.to_numeric(view["price_krw"], errors="coerce").map(lambda v: f"{v:,.2f}" if pd.notna(v) else "-")
             view["20일평균거래대금(억원)표시"] = pd.to_numeric(view["20일평균거래대금(억원)"], errors="coerce").map(lambda v: f"{v:,.2f}" if pd.notna(v) else "-")
             cols = [
-                "score", "market", "ticker", "name", "가격표시", "현재가(KRW)표시", "20일평균거래대금(억원)표시", "dividend_yield_pct",
+                "score", "market", "ticker", "name", "가격표시", "현재가(KRW)표시", "20일평균거래대금(억원)표시", "dividend_yield_pct", "dividend_cycle",
                 "per", "roe_pct", "per_roe_ratio", "ev_to_ebitda",
                 "sector", "sector_strength_score", "sector_new_high_count", "sector_new_high_ratio",
                 "D_ma20", "D_ma60", "D_ma120", "W_ma20", "W_ma60", "W_ma120", "M_ma20", "M_ma60", "M_ma120",
@@ -2860,6 +3107,7 @@ def main() -> None:
                 "가격표시": "가격",
                 "현재가(KRW)표시": "현재가(KRW)",
                 "dividend_yield_pct": "배당수익률(%)",
+                "dividend_cycle": "배당주기",
                 "per": "PER",
                 "roe_pct": "ROE(%)",
                 "per_roe_ratio": "PER/ROE",
