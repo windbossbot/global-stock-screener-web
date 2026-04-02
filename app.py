@@ -75,6 +75,8 @@ SECTOR_SEED_PATH = CACHE_DIR / "sector_seed.csv"
 KRX_KEY_PATH = CACHE_DIR / "krx_api_key.txt"
 KR_SEED_PATH = CACHE_DIR / "kr_universe_seed.csv"
 KR_SECTOR_MASTER_PATH = CACHE_DIR / "kr_sector_master.csv"
+RESULT_EXPORT_DIR = CACHE_DIR / "exports"
+RESULT_EXPORT_LATEST_PATH = RESULT_EXPORT_DIR / "latest_screener.csv"
 KRX_OPENAPI_ENDPOINTS = [
     ("KOSPI", "https://data.krx.co.kr/svc/apis/sto/stk_bydd_trd"),
     ("KOSDAQ", "https://data.krx.co.kr/svc/apis/sto/ksq_bydd_trd"),
@@ -137,6 +139,20 @@ def save_universe_cache(df: pd.DataFrame, path: Path) -> None:
         df.to_csv(path, index=False, encoding="utf-8-sig")
     except Exception:
         pass
+
+
+def save_result_csv(df: pd.DataFrame) -> Tuple[bool, str]:
+    try:
+        if df is None or df.empty:
+            return False, "저장할 결과가 없습니다."
+        RESULT_EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        snapshot_path = RESULT_EXPORT_DIR / f"screener_{stamp}.csv"
+        df.to_csv(snapshot_path, index=False, encoding="utf-8-sig")
+        df.to_csv(RESULT_EXPORT_LATEST_PATH, index=False, encoding="utf-8-sig")
+        return True, str(snapshot_path)
+    except Exception as e:
+        return False, str(e)
 
 
 def load_universe_cache(path: Path) -> pd.DataFrame:
@@ -800,45 +816,89 @@ def _nearest_krx_date() -> Optional[str]:
 
 
 def enrich_kr_fundamentals(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, float]]:
-    # Fill KR dividend from pykrx in bulk (market cap excluded by policy).
+    # Fill KR dividend/value metrics from pykrx in bulk.
     if df.empty:
-        return df, {"kr_fund_div_filled": 0.0}
+        return df, {"kr_fund_div_filled": 0.0, "kr_per_filled": 0.0, "kr_roe_filled": 0.0, "kr_per_roe_filled": 0.0}
     out = df.copy()
     kr_mask = out["market"].astype(str).str.upper().eq("KR")
     if kr_mask.sum() == 0:
-        return out, {"kr_fund_div_filled": 0.0}
+        return out, {"kr_fund_div_filled": 0.0, "kr_per_filled": 0.0, "kr_roe_filled": 0.0, "kr_per_roe_filled": 0.0}
 
     before_div = int(pd.to_numeric(out.loc[kr_mask, "dividend_yield_pct"], errors="coerce").notna().sum())
+    before_per = int(pd.to_numeric(out.loc[kr_mask, "per"], errors="coerce").notna().sum()) if "per" in out.columns else 0
+    before_roe = int(pd.to_numeric(out.loc[kr_mask, "roe_pct"], errors="coerce").notna().sum()) if "roe_pct" in out.columns else 0
+    before_per_roe = int(pd.to_numeric(out.loc[kr_mask, "per_roe_ratio"], errors="coerce").notna().sum()) if "per_roe_ratio" in out.columns else 0
 
     date = _nearest_krx_date()
     if not date:
-        return out, {"kr_fund_div_filled": 0.0}
+        return out, {"kr_fund_div_filled": 0.0, "kr_per_filled": 0.0, "kr_roe_filled": 0.0, "kr_per_roe_filled": 0.0}
     fund = pd.DataFrame()
     try:
         fdf = pykrx_stock.get_market_fundamental_by_ticker(date, market="ALL")
         if fdf is not None and not fdf.empty:
             fdf = fdf.reset_index().rename(columns={fdf.columns[0]: "ticker"})
             fdf["ticker"] = fdf["ticker"].astype(str).str.zfill(6)
-            div_col = "DIV" if "DIV" in fdf.columns else None
-            if div_col:
-                fund = fdf[["ticker", div_col]].rename(columns={div_col: "div_fill"})
+            keep_cols = ["ticker"]
+            rename_map = {}
+            for src, dst in [("DIV", "div_fill"), ("PER", "per_fill"), ("PBR", "pbr_fill"), ("EPS", "eps_fill"), ("BPS", "bps_fill")]:
+                if src in fdf.columns:
+                    keep_cols.append(src)
+                    rename_map[src] = dst
+            if len(keep_cols) > 1:
+                fund = fdf[keep_cols].rename(columns=rename_map)
     except Exception:
         pass
 
-    merged = out.loc[kr_mask, ["ticker", "dividend_yield_pct"]].copy()
+    merged = out.loc[kr_mask, ["ticker"]].copy()
+    merged["dividend_yield_pct"] = pd.to_numeric(out.loc[kr_mask, "dividend_yield_pct"], errors="coerce")
+    merged["per"] = pd.to_numeric(out.loc[kr_mask, "per"], errors="coerce") if "per" in out.columns else pd.Series(index=merged.index, dtype=float)
+    merged["roe_pct"] = pd.to_numeric(out.loc[kr_mask, "roe_pct"], errors="coerce") if "roe_pct" in out.columns else pd.Series(index=merged.index, dtype=float)
+    merged["per_roe_ratio"] = pd.to_numeric(out.loc[kr_mask, "per_roe_ratio"], errors="coerce") if "per_roe_ratio" in out.columns else pd.Series(index=merged.index, dtype=float)
     merged["ticker"] = merged["ticker"].astype(str).str.zfill(6)
     if not fund.empty:
         merged = merged.merge(fund, on="ticker", how="left")
+        div_fill = _numeric_series(merged, "div_fill")
         merged["dividend_yield_pct"] = pd.to_numeric(merged["dividend_yield_pct"], errors="coerce").where(
             pd.to_numeric(merged["dividend_yield_pct"], errors="coerce").notna(),
-            pd.to_numeric(merged.get("div_fill"), errors="coerce"),
+            div_fill,
+        )
+        per_fill = _numeric_series(merged, "per_fill")
+        pbr_fill = _numeric_series(merged, "pbr_fill")
+        eps_fill = _numeric_series(merged, "eps_fill")
+        bps_fill = _numeric_series(merged, "bps_fill")
+        merged["per"] = pd.to_numeric(merged["per"], errors="coerce").where(
+            pd.to_numeric(merged["per"], errors="coerce").notna(),
+            per_fill,
+        )
+        roe_from_eps = ((eps_fill / bps_fill) * 100.0).where(eps_fill.notna() & bps_fill.notna() & (bps_fill != 0))
+        roe_from_ratio = ((pbr_fill / per_fill) * 100.0).where(pbr_fill.notna() & per_fill.notna() & (per_fill != 0))
+        roe_fill = roe_from_eps.where(roe_from_eps.notna(), roe_from_ratio)
+        merged["roe_pct"] = pd.to_numeric(merged["roe_pct"], errors="coerce").where(
+            pd.to_numeric(merged["roe_pct"], errors="coerce").notna(),
+            roe_fill,
         )
 
     out.loc[kr_mask, "dividend_yield_pct"] = merged["dividend_yield_pct"].values
+    out.loc[kr_mask, "per"] = merged["per"].values
+    out.loc[kr_mask, "roe_pct"] = merged["roe_pct"].values
+    per_series = pd.to_numeric(merged["per"], errors="coerce")
+    roe_series = pd.to_numeric(merged["roe_pct"], errors="coerce")
+    ratio_fill = (per_series / roe_series).where(per_series.notna() & roe_series.notna() & (roe_series != 0))
+    merged["per_roe_ratio"] = pd.to_numeric(merged["per_roe_ratio"], errors="coerce").where(
+        pd.to_numeric(merged["per_roe_ratio"], errors="coerce").notna(),
+        ratio_fill,
+    )
+    out.loc[kr_mask, "per_roe_ratio"] = merged["per_roe_ratio"].values
 
     after_div = int(pd.to_numeric(out.loc[kr_mask, "dividend_yield_pct"], errors="coerce").notna().sum())
+    after_per = int(pd.to_numeric(out.loc[kr_mask, "per"], errors="coerce").notna().sum())
+    after_roe = int(pd.to_numeric(out.loc[kr_mask, "roe_pct"], errors="coerce").notna().sum())
+    after_per_roe = int(pd.to_numeric(out.loc[kr_mask, "per_roe_ratio"], errors="coerce").notna().sum())
     return out, {
         "kr_fund_div_filled": float(max(0, after_div - before_div)),
+        "kr_per_filled": float(max(0, after_per - before_per)),
+        "kr_roe_filled": float(max(0, after_roe - before_roe)),
+        "kr_per_roe_filled": float(max(0, after_per_roe - before_per_roe)),
     }
 
 
@@ -1001,6 +1061,57 @@ def _safe_float(v) -> Optional[float]:
         return None
 
 
+def _normalize_dividend_yield_pct(v, annual_dividend_rate=None, price=None) -> Optional[float]:
+    n = _safe_float(v)
+    if n is None or n < 0:
+        return None
+    rate = _safe_float(annual_dividend_rate)
+    px = _safe_float(price)
+    if rate is not None and px is not None and px > 0:
+        expected_pct = (rate / px) * 100.0
+        raw_gap = abs(n - expected_pct)
+        scaled_gap = abs((n * 100.0) - expected_pct)
+        return n if raw_gap <= scaled_gap else (n * 100.0)
+    # Upstream sources are inconsistent: some return ratios (0.004),
+    # others already return percentage values (0.4, 4.0).
+    if n <= 0.2:
+        return n * 100.0
+    return n
+
+
+def _normalize_ratio_pct(v) -> Optional[float]:
+    n = _safe_float(v)
+    if n is None:
+        return None
+    if -1.0 <= n <= 1.0:
+        return n * 100.0
+    return n
+
+
+def _extract_raw_value(v):
+    if isinstance(v, dict):
+        for key in ["raw", "fmt", "longFmt"]:
+            if key in v and v.get(key) not in [None, ""]:
+                return v.get(key)
+        return None
+    return v
+
+
+def _numeric_series(df: pd.DataFrame, col: str) -> pd.Series:
+    series = df.get(col)
+    if isinstance(series, pd.Series):
+        return pd.to_numeric(series, errors="coerce")
+    return pd.Series(index=df.index, dtype=float)
+
+
+def _compute_per_roe_ratio(per, roe_pct) -> Optional[float]:
+    per_num = _safe_float(per)
+    roe_num = _safe_float(roe_pct)
+    if per_num is None or roe_num is None or roe_num == 0:
+        return None
+    return per_num / roe_num
+
+
 def _to_eok(v) -> Optional[float]:
     n = _safe_float(v)
     if n is None:
@@ -1068,9 +1179,17 @@ def _build_metrics_from_history(item: Dict, hist: pd.DataFrame, fx: Optional[flo
     vol20 = float(vol.tail(20).mean()) if len(vol) >= 20 else None
     vol_last = float(vol.iloc[-1]) if len(vol) >= 1 else None
 
-    dy = _safe_float(info.get("dividendYield"))
-    if dy is not None:
-        dy *= 100.0
+    info_div_rate = _safe_float(info.get("dividendRate"))
+    if info_div_rate is None:
+        info_div_rate = _safe_float(info.get("trailingAnnualDividendRate"))
+    info_price = _safe_float(info.get("currentPrice"))
+    if info_price is None:
+        info_price = _safe_float(info.get("regularMarketPrice"))
+    dy = _normalize_dividend_yield_pct(
+        info.get("dividendYield"),
+        annual_dividend_rate=info_div_rate,
+        price=info_price if info_price is not None else price,
+    )
     # Fast-mode fallback: compute dividend yield from downloaded price actions.
     if dy is None and "Dividends" in hist.columns:
         try:
@@ -1138,6 +1257,12 @@ def _build_metrics_from_history(item: Dict, hist: pd.DataFrame, fx: Optional[flo
             is_new_high_52w = price >= (max_52w * 0.999)
 
     price_krw = price * fx if item["currency"] == "USD" and fx else (price if item["currency"] == "KRW" else None)
+    per = _safe_float(info.get("trailingPE"))
+    if per is None:
+        per = _safe_float(info.get("forwardPE"))
+    roe_pct = _normalize_ratio_pct(info.get("returnOnEquity"))
+    ev_to_ebitda = _safe_float(info.get("enterpriseToEbitda"))
+    per_roe_ratio = _compute_per_roe_ratio(per, roe_pct)
 
     return {
         "market": item["market"],
@@ -1149,6 +1274,10 @@ def _build_metrics_from_history(item: Dict, hist: pd.DataFrame, fx: Optional[flo
         "price_krw": round(price_krw, 2) if price_krw is not None else None,
         "dividend_yield_pct": round(dy, 4) if dy is not None else None,
         "avg_traded_value_krw_20": round(traded_value_krw, 2) if traded_value_krw is not None else None,
+        "per": round(per, 4) if per is not None else None,
+        "roe_pct": round(roe_pct, 4) if roe_pct is not None else None,
+        "per_roe_ratio": round(per_roe_ratio, 4) if per_roe_ratio is not None else None,
+        "ev_to_ebitda": round(ev_to_ebitda, 4) if ev_to_ebitda is not None else None,
         "listing_days": listing_days,
         **d_ma,
         **w_ma,
@@ -1343,6 +1472,133 @@ def _fetch_sector_single(yf_ticker: str, market: str, ticker: str) -> Tuple[str,
     return market, ticker, (sector if sector else "Unknown")
 
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_valuation_snapshot(yf_ticker: str) -> Dict[str, Optional[float]]:
+    endpoints = [
+        "https://query2.finance.yahoo.com/v10/finance/quoteSummary",
+        "https://query1.finance.yahoo.com/v10/finance/quoteSummary",
+    ]
+    params = {"modules": "financialData,defaultKeyStatistics,summaryDetail"}
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for base in endpoints:
+        for retry in range(2):
+            try:
+                r = requests.get(f"{base}/{yf_ticker}", params=params, timeout=8, headers=headers)
+                r.raise_for_status()
+                d = r.json()
+                result = (((d or {}).get("quoteSummary") or {}).get("result") or [{}])[0]
+                financial_data = result.get("financialData") or {}
+                key_stats = result.get("defaultKeyStatistics") or {}
+                summary_detail = result.get("summaryDetail") or {}
+                per = _safe_float(_extract_raw_value(summary_detail.get("trailingPE")))
+                if per is None:
+                    per = _safe_float(_extract_raw_value(key_stats.get("trailingPE")))
+                if per is None:
+                    per = _safe_float(_extract_raw_value(financial_data.get("forwardPE")))
+                roe_pct = _normalize_ratio_pct(_extract_raw_value(financial_data.get("returnOnEquity")))
+                if roe_pct is None:
+                    roe_pct = _normalize_ratio_pct(_extract_raw_value(key_stats.get("returnOnEquity")))
+                ev_to_ebitda = _safe_float(_extract_raw_value(key_stats.get("enterpriseToEbitda")))
+                if ev_to_ebitda is None:
+                    ev_to_ebitda = _safe_float(_extract_raw_value(financial_data.get("enterpriseToEbitda")))
+                return {
+                    "per": per,
+                    "roe_pct": roe_pct,
+                    "per_roe_ratio": _compute_per_roe_ratio(per, roe_pct),
+                    "ev_to_ebitda": ev_to_ebitda,
+                }
+            except Exception:
+                time.sleep(0.35 * (retry + 1))
+                continue
+    return {"per": None, "roe_pct": None, "per_roe_ratio": None, "ev_to_ebitda": None}
+
+
+def enrich_valuation_metrics(
+    df: pd.DataFrame,
+    workers: int = 4,
+    timeout_sec: int = 45,
+    need_per: bool = False,
+    need_roe: bool = False,
+    need_ev: bool = False,
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    if df.empty:
+        return df, {"valuation_targets": 0.0, "valuation_timeout": 0.0, "valuation_per_filled": 0.0, "valuation_roe_filled": 0.0, "valuation_ev_filled": 0.0}
+    if not any([need_per, need_roe, need_ev]):
+        out = df.copy()
+        per_series = _numeric_series(out, "per")
+        roe_series = _numeric_series(out, "roe_pct")
+        out["per_roe_ratio"] = (per_series / roe_series).where(per_series.notna() & roe_series.notna() & (roe_series != 0))
+        return out, {"valuation_targets": 0.0, "valuation_timeout": 0.0, "valuation_per_filled": 0.0, "valuation_roe_filled": 0.0, "valuation_ev_filled": 0.0}
+
+    out = df.copy()
+    before_per = int(_numeric_series(out, "per").notna().sum())
+    before_roe = int(_numeric_series(out, "roe_pct").notna().sum())
+    before_ev = int(_numeric_series(out, "ev_to_ebitda").notna().sum())
+
+    need_mask = pd.Series(False, index=out.index)
+    if need_per:
+        need_mask = need_mask | _numeric_series(out, "per").isna()
+    if need_roe:
+        need_mask = need_mask | _numeric_series(out, "roe_pct").isna()
+    if need_ev:
+        need_mask = need_mask | _numeric_series(out, "ev_to_ebitda").isna()
+
+    targets = out.loc[need_mask, "yf_ticker"].dropna().astype(str).unique().tolist()
+    if targets:
+        value_map: Dict[str, Dict[str, Optional[float]]] = {}
+        max_workers = max(1, min(int(workers), 6))
+        timeout_count = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(fetch_valuation_snapshot, yf_ticker): yf_ticker for yf_ticker in targets}
+            try:
+                for future in concurrent.futures.as_completed(futures, timeout=timeout_sec):
+                    yf_ticker = futures[future]
+                    try:
+                        value_map[yf_ticker] = future.result()
+                    except Exception:
+                        value_map[yf_ticker] = {"per": None, "roe_pct": None, "per_roe_ratio": None, "ev_to_ebitda": None}
+            except concurrent.futures.TimeoutError:
+                pass
+            pending = [future for future in futures if not future.done()]
+            timeout_count = len(pending)
+            for future in pending:
+                future.cancel()
+            for future, yf_ticker in futures.items():
+                if yf_ticker in value_map:
+                    continue
+                if future.done():
+                    try:
+                        value_map[yf_ticker] = future.result()
+                    except Exception:
+                        value_map[yf_ticker] = {"per": None, "roe_pct": None, "per_roe_ratio": None, "ev_to_ebitda": None}
+
+        if value_map:
+            if need_per:
+                per_fill = out["yf_ticker"].map({k: v.get("per") for k, v in value_map.items()})
+                out["per"] = _numeric_series(out, "per").where(_numeric_series(out, "per").notna(), per_fill)
+            if need_roe:
+                roe_fill = out["yf_ticker"].map({k: v.get("roe_pct") for k, v in value_map.items()})
+                out["roe_pct"] = _numeric_series(out, "roe_pct").where(_numeric_series(out, "roe_pct").notna(), roe_fill)
+            if need_ev:
+                ev_fill = out["yf_ticker"].map({k: v.get("ev_to_ebitda") for k, v in value_map.items()})
+                out["ev_to_ebitda"] = _numeric_series(out, "ev_to_ebitda").where(_numeric_series(out, "ev_to_ebitda").notna(), ev_fill)
+        per_series = _numeric_series(out, "per")
+        roe_series = _numeric_series(out, "roe_pct")
+        out["per_roe_ratio"] = (per_series / roe_series).where(per_series.notna() & roe_series.notna() & (roe_series != 0))
+        return out, {
+            "valuation_targets": float(len(targets)),
+            "valuation_timeout": float(timeout_count),
+            "valuation_per_filled": float(max(0, int(_numeric_series(out, "per").notna().sum()) - before_per)),
+            "valuation_roe_filled": float(max(0, int(_numeric_series(out, "roe_pct").notna().sum()) - before_roe)),
+            "valuation_ev_filled": float(max(0, int(_numeric_series(out, "ev_to_ebitda").notna().sum()) - before_ev)),
+        }
+
+    per_series = _numeric_series(out, "per")
+    roe_series = _numeric_series(out, "roe_pct")
+    out["per_roe_ratio"] = (per_series / roe_series).where(per_series.notna() & roe_series.notna() & (roe_series != 0))
+    return out, {"valuation_targets": 0.0, "valuation_timeout": 0.0, "valuation_per_filled": 0.0, "valuation_roe_filled": 0.0, "valuation_ev_filled": 0.0}
+
+
 def enrich_dividend_from_quote(df: pd.DataFrame) -> pd.DataFrame:
     # Lightweight batch dividend fill for fast mode.
     if df.empty or "dividend_yield_pct" not in df.columns:
@@ -1369,9 +1625,13 @@ def enrich_dividend_from_quote(df: pd.DataFrame) -> pd.DataFrame:
                 dy = q.get("trailingAnnualDividendYield")
                 if dy is None:
                     dy = q.get("dividendYield")
-                v = _safe_float(dy)
+                v = _normalize_dividend_yield_pct(
+                    dy,
+                    annual_dividend_rate=q.get("trailingAnnualDividendRate"),
+                    price=q.get("regularMarketPrice"),
+                )
                 if sym and v is not None:
-                    dy_map[sym] = v * 100.0
+                    dy_map[sym] = v
         except Exception:
             continue
     if dy_map:
@@ -1425,14 +1685,18 @@ def enrich_quote_snapshot(
                         dy = q.get("trailingAnnualDividendYield")
                         if dy is None:
                             dy = q.get("dividendYield")
-                        vdy = _safe_float(dy)
+                        vdy = _normalize_dividend_yield_pct(
+                            dy,
+                            annual_dividend_rate=q.get("trailingAnnualDividendRate"),
+                            price=q.get("regularMarketPrice"),
+                        )
                         if vdy is None:
                             dps = _safe_float(q.get("trailingAnnualDividendRate"))
                             px = _safe_float(q.get("regularMarketPrice"))
                             if dps is not None and px is not None and px > 0:
-                                vdy = dps / px
+                                vdy = (dps / px) * 100.0
                         if vdy is not None:
-                            dy_map[sym] = vdy * 100.0
+                            dy_map[sym] = vdy
                     got = True
                     break
                 except Exception as e:
@@ -1893,6 +2157,29 @@ def apply_etf_mode(df: pd.DataFrame, mode: str) -> pd.DataFrame:
     return df
 
 
+def apply_valuation_filters(
+    df: pd.DataFrame,
+    per_max: float = 0.0,
+    roe_min: float = 0.0,
+    per_roe_max: float = 0.0,
+    ev_to_ebitda_max: float = 0.0,
+) -> pd.DataFrame:
+    out = df.copy()
+    if per_max > 0:
+        per = _numeric_series(out, "per")
+        out = out[per.notna() & (per <= float(per_max))]
+    if roe_min > 0:
+        roe = _numeric_series(out, "roe_pct")
+        out = out[roe.notna() & (roe >= float(roe_min))]
+    if per_roe_max > 0:
+        per_roe = _numeric_series(out, "per_roe_ratio")
+        out = out[per_roe.notna() & (per_roe <= float(per_roe_max))]
+    if ev_to_ebitda_max > 0:
+        ev_to_ebitda = _numeric_series(out, "ev_to_ebitda")
+        out = out[ev_to_ebitda.notna() & (ev_to_ebitda <= float(ev_to_ebitda_max))]
+    return out
+
+
 def apply_condition_list(df: pd.DataFrame, selected: List[str]) -> pd.DataFrame:
     out = df.copy()
     for cond in selected:
@@ -2196,6 +2483,17 @@ def main() -> None:
         selected_conditions = st.multiselect("적용 조건", condition_options, default=preset_map[preset])
 
         st.divider()
+        st.subheader("재무 조건 필터")
+        v1, v2 = st.columns(2)
+        with v1:
+            per_max = st.number_input("PER 최대 (0=사용 안함)", min_value=0.0, value=0.0, step=1.0)
+            per_roe_max = st.number_input("PER/ROE 최대 (0=사용 안함)", min_value=0.0, value=0.0, step=0.1, format="%.2f")
+        with v2:
+            roe_min = st.number_input("ROE 최소 % (0=사용 안함)", min_value=0.0, value=0.0, step=1.0)
+            ev_to_ebitda_max = st.number_input("EV/EBITDA 최대 (0=사용 안함)", min_value=0.0, value=0.0, step=0.5, format="%.2f")
+        st.caption("재무 조건은 기술적 필터로 후보를 줄인 뒤 마지막 단계에서만 보강합니다.")
+
+        st.divider()
         st.subheader("이평 근접도 필터")
         near_tf_label = st.selectbox("근접도 기준 봉", ["사용 안함", "일봉", "주봉", "월봉"], index=0)
         near_periods = st.multiselect("근접 체크 MA", [20, 60, 120], default=[])
@@ -2214,6 +2512,10 @@ def main() -> None:
                 "min_price": min_price,
                 "max_price": max_price,
                 "etf_mode": etf_mode,
+                "per_max": per_max,
+                "roe_min": roe_min,
+                "per_roe_max": per_roe_max,
+                "ev_to_ebitda_max": ev_to_ebitda_max,
             }
             st.success(f"저장 완료: {save_name.strip()}")
 
@@ -2227,16 +2529,16 @@ def main() -> None:
 
         st.divider()
         with st.expander("고급 옵션", expanded=False):
-            workers = st.slider("병렬 스레드 (권장 6~8)", 2, 12, 8, 1)
+            workers = st.slider("병렬 스레드 (권장 4~6)", 2, 12, 6, 1)
             speed_mode = st.toggle("고속 모드 (기본 ON)", value=True, help="ON: 속도 우선, 일부 상세 정보 호출 최소화")
             history_period = st.selectbox("조회 기간", ["2y", "3y", "5y"], index=0, help="고속 모드에서 짧을수록 빠름")
             sector_scoring = st.toggle("섹터 강도 점수화", value=True, help="섹터별 52주 신고가 개수 기반 가점")
             sector_pick_mode = st.selectbox("섹터 보강 대상", ["상위", "랜덤"], index=0, help="상위: 현재 정렬 순서 기준 / 랜덤: 무작위")
-            sector_pick_label = st.selectbox("섹터 보강 개수", ["상위 50", "상위 200", "상위 400", "상위 800", "전체"], index=2)
-            sector_limit_map = {"상위 50": 50, "상위 200": 200, "상위 400": 400, "상위 800": 800, "전체": 0}
-            sector_fetch_limit = sector_limit_map.get(sector_pick_label, 400)
+            sector_pick_label = st.selectbox("섹터 보강 개수", ["상위 50", "상위 100", "상위 200", "상위 400", "전체"], index=1)
+            sector_limit_map = {"상위 50": 50, "상위 100": 100, "상위 200": 200, "상위 400": 400, "전체": 0}
+            sector_fetch_limit = sector_limit_map.get(sector_pick_label, 100)
             sector_workers = st.slider("섹터 수집 스레드", 1, 8, 4, 1)
-            sector_max_seconds = st.slider("섹터 수집 최대시간(초)", 30, 1800, 300, 30)
+            sector_max_seconds = st.slider("섹터 수집 최대시간(초)", 30, 1800, 180, 30)
             max_symbols = st.number_input("최대 스캔 수 (0=전체)", 0, 20000, 0, 100)
             if st.button("KRX 연결 체크"):
                 ok, msg = check_krx_connection()
@@ -2340,6 +2642,11 @@ def main() -> None:
         run_min_price = active_cfg["min_price"] if active_cfg else min_price
         run_max_price = active_cfg["max_price"] if active_cfg else max_price
         run_etf_mode = active_cfg["etf_mode"] if active_cfg else etf_mode
+        run_per_max = float(active_cfg.get("per_max", 0.0)) if active_cfg else float(per_max)
+        run_roe_min = float(active_cfg.get("roe_min", 0.0)) if active_cfg else float(roe_min)
+        run_per_roe_max = float(active_cfg.get("per_roe_max", 0.0)) if active_cfg else float(per_roe_max)
+        run_ev_to_ebitda_max = float(active_cfg.get("ev_to_ebitda_max", 0.0)) if active_cfg else float(ev_to_ebitda_max)
+        valuation_active = any(v > 0 for v in [run_per_max, run_roe_min, run_per_roe_max, run_ev_to_ebitda_max])
         run_workers = workers
         run_fetch_info = not speed_mode
         run_history_period = adjust_history_period(
@@ -2350,9 +2657,9 @@ def main() -> None:
 
         # Speed-up: prefilter target list before API calls where possible.
         fast_universe = prefilter_universe_fast(universe, run_etf_mode)
-        if len(fast_universe) > 2000 and run_workers > 8:
-            run_workers = 8
-            st.info("대규모 스캔에서 429 완화를 위해 병렬 스레드를 8로 자동 조정했습니다.")
+        if len(fast_universe) > 1500 and run_workers > 6:
+            run_workers = 6
+            st.info("대규모 스캔에서 Render 응답성과 429 완화를 위해 병렬 스레드를 6으로 자동 조정했습니다.")
         raw, scan_stats = run_scan(
             fast_universe,
             fx,
@@ -2423,14 +2730,36 @@ def main() -> None:
             near_tf = {"일봉": "D", "주봉": "W", "월봉": "M"}[run_near_tf_label]
             filtered = apply_ma_near_filter(filtered, near_tf, run_near_periods, run_near_pct)
         post_near = len(filtered)
+        post_value = post_near
         scan_stats["t_filter_sec"] = round(time.time() - t_filter0, 2)
 
         quote_stats = {}
+        valuation_stats = {}
         if not filtered.empty:
             t_krfund0 = time.time()
             filtered, kr_fund_stats = enrich_kr_fundamentals(filtered)
             kr_fund_stats["t_krfund_sec"] = round(time.time() - t_krfund0, 2)
             scan_stats.update(kr_fund_stats)
+        if valuation_active and not filtered.empty:
+            t_value0 = time.time()
+            filtered, valuation_stats = enrich_valuation_metrics(
+                filtered,
+                workers=min(run_workers, 6),
+                timeout_sec=45 if speed_mode else 90,
+                need_per=(run_per_max > 0 or run_per_roe_max > 0),
+                need_roe=(run_roe_min > 0 or run_per_roe_max > 0),
+                need_ev=(run_ev_to_ebitda_max > 0),
+            )
+            filtered = apply_valuation_filters(
+                filtered,
+                per_max=run_per_max,
+                roe_min=run_roe_min,
+                per_roe_max=run_per_roe_max,
+                ev_to_ebitda_max=run_ev_to_ebitda_max,
+            )
+            post_value = len(filtered)
+            valuation_stats["t_value_sec"] = round(time.time() - t_value0, 2)
+            scan_stats.update(valuation_stats)
         if speed_mode and not filtered.empty:
             t_quote0 = time.time()
             filtered, quote_stats = enrich_quote_snapshot(filtered, fx, limit=2500)
@@ -2460,10 +2789,15 @@ def main() -> None:
         scan_stats["final_kr_count"] = float((filtered["market"] == "KR").sum()) if "market" in filtered.columns else 0.0
         scan_stats["t_total_sec"] = round(time.time() - pipeline_t0, 2)
 
+        csv_ok, csv_msg = save_result_csv(filtered) if not filtered.empty else (False, "저장할 결과가 없습니다.")
+        st.session_state["last_saved_csv_ok"] = csv_ok
+        st.session_state["last_saved_csv_message"] = csv_msg
+
         elapsed = datetime.now() - started
+        value_segment = f" -> 재무조건 {post_value:,}" if valuation_active else ""
         st.success(
             f"{pre:,} -> 가격 {post_price:,} -> ETF {post_etf:,} -> 강제제외 {post_hard:,} "
-            f"-> 기본조건 {post_basic:,} -> 봉이평 {post_tf:,} -> 근접도 {post_near:,} -> 최종 {len(filtered):,} "
+            f"-> 기본조건 {post_basic:,} -> 봉이평 {post_tf:,} -> 근접도 {post_near:,}{value_segment} -> 최종 {len(filtered):,} "
             f"(소요 {str(elapsed).split('.')[0]})"
         )
         if len(filtered) == 0:
@@ -2471,7 +2805,7 @@ def main() -> None:
         st.session_state["last_filtered"] = filtered.copy()
         st.session_state["last_summary"] = (
             f"{pre:,} -> 가격 {post_price:,} -> ETF {post_etf:,} -> 강제제외 {post_hard:,} "
-            f"-> 기본조건 {post_basic:,} -> 봉이평 {post_tf:,} -> 근접도 {post_near:,} -> 최종 {len(filtered):,} "
+            f"-> 기본조건 {post_basic:,} -> 봉이평 {post_tf:,} -> 근접도 {post_near:,}{value_segment} -> 최종 {len(filtered):,} "
             f"(소요 {str(elapsed).split('.')[0]})"
         )
 
@@ -2495,6 +2829,7 @@ def main() -> None:
             view["20일평균거래대금(억원)표시"] = pd.to_numeric(view["20일평균거래대금(억원)"], errors="coerce").map(lambda v: f"{v:,.2f}" if pd.notna(v) else "-")
             cols = [
                 "score", "market", "ticker", "name", "가격표시", "현재가(KRW)표시", "20일평균거래대금(억원)표시", "dividend_yield_pct",
+                "per", "roe_pct", "per_roe_ratio", "ev_to_ebitda",
                 "sector", "sector_strength_score", "sector_new_high_count", "sector_new_high_ratio",
                 "D_ma20", "D_ma60", "D_ma120", "W_ma20", "W_ma60", "W_ma120", "M_ma20", "M_ma60", "M_ma120",
                 "price_above_120", "ma60_up", "pullback_20", "vol_surge", "box_breakout", "strong_trend", "general_trend",
@@ -2509,6 +2844,10 @@ def main() -> None:
                 "가격표시": "가격",
                 "현재가(KRW)표시": "현재가(KRW)",
                 "dividend_yield_pct": "배당수익률(%)",
+                "per": "PER",
+                "roe_pct": "ROE(%)",
+                "per_roe_ratio": "PER/ROE",
+                "ev_to_ebitda": "EV/EBITDA",
                 "sector": "섹터",
                 "sector_strength_score": "섹터강도점수",
                 "sector_new_high_count": "섹터신고가수",
@@ -2539,6 +2878,10 @@ def main() -> None:
                 height=650,
                 column_config={
                     "배당수익률(%)": st.column_config.NumberColumn(format="%.2f"),
+                    "PER": st.column_config.NumberColumn(format="%.2f"),
+                    "ROE(%)": st.column_config.NumberColumn(format="%.2f"),
+                    "PER/ROE": st.column_config.NumberColumn(format="%.3f"),
+                    "EV/EBITDA": st.column_config.NumberColumn(format="%.2f"),
                     "섹터강도점수": st.column_config.NumberColumn(format="%.2f"),
                     "섹터신고가비율": st.column_config.NumberColumn(format="%.4f"),
                 },
@@ -2554,6 +2897,13 @@ def main() -> None:
 
         with tabs[2]:
             st.dataframe(filtered, use_container_width=True, height=700)
+            last_saved_csv_ok = bool(st.session_state.get("last_saved_csv_ok"))
+            last_saved_csv_message = str(st.session_state.get("last_saved_csv_message", "")).strip()
+            if last_saved_csv_message:
+                if last_saved_csv_ok:
+                    st.caption(f"서버 CSV 저장: {last_saved_csv_message}")
+                else:
+                    st.caption(f"서버 CSV 저장 실패: {last_saved_csv_message}")
             csv = filtered.to_csv(index=False).encode("utf-8-sig")
             st.download_button("CSV 다운로드", csv, file_name=f"screener_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
 
@@ -2610,6 +2960,7 @@ def main() -> None:
                 {"항목": "단계시간: 섹터(초)", "값": scan_stats.get("t_sector_sec", "-")},
                 {"항목": "단계시간: 필터(초)", "값": scan_stats.get("t_filter_sec", "-")},
                 {"항목": "단계시간: KR보강(초)", "값": scan_stats.get("t_krfund_sec", "-")},
+                {"항목": "단계시간: 재무보강(초)", "값": scan_stats.get("t_value_sec", "-")},
                 {"항목": "단계시간: 시세보강(초)", "값": scan_stats.get("t_quote_sec", "-")},
                 {"항목": "단계시간: 점수(초)", "값": scan_stats.get("t_score_sec", "-")},
                 {"항목": "단계시간: 정렬(초)", "값": scan_stats.get("t_sort_sec", "-")},
@@ -2638,6 +2989,13 @@ def main() -> None:
                 {"항목": "배당 보강 건수", "값": int(scan_stats.get("quote_div_filled", 0)) if "quote_div_filled" in scan_stats else "-"},
                 {"항목": "개별 보강 호출수", "값": int(scan_stats.get("quote_fallback_used", 0)) if "quote_fallback_used" in scan_stats else "-"},
                 {"항목": "KR 배당 보강 건수", "값": int(scan_stats.get("kr_fund_div_filled", 0)) if "kr_fund_div_filled" in scan_stats else "-"},
+                {"항목": "KR PER 보강 건수", "값": int(scan_stats.get("kr_per_filled", 0)) if "kr_per_filled" in scan_stats else "-"},
+                {"항목": "KR ROE 보강 건수", "값": int(scan_stats.get("kr_roe_filled", 0)) if "kr_roe_filled" in scan_stats else "-"},
+                {"항목": "재무 보강 대상 수", "값": int(scan_stats.get("valuation_targets", 0)) if "valuation_targets" in scan_stats else "-"},
+                {"항목": "재무 보강 타임아웃 수", "값": int(scan_stats.get("valuation_timeout", 0)) if "valuation_timeout" in scan_stats else "-"},
+                {"항목": "재무 PER 보강 건수", "값": int(scan_stats.get("valuation_per_filled", 0)) if "valuation_per_filled" in scan_stats else "-"},
+                {"항목": "재무 ROE 보강 건수", "값": int(scan_stats.get("valuation_roe_filled", 0)) if "valuation_roe_filled" in scan_stats else "-"},
+                {"항목": "재무 EV/EBITDA 보강 건수", "값": int(scan_stats.get("valuation_ev_filled", 0)) if "valuation_ev_filled" in scan_stats else "-"},
             ]
             st.markdown("#### 임시 디버그 정보")
             st.dataframe(pd.DataFrame(debug_rows), use_container_width=True, height=280)

@@ -2,6 +2,10 @@
 headless = true
 enableCORS = false
 enableXsrfProtection = false
+fileWatcherType = "none"
+
+[runner]
+fastReruns = true
 
 [browser]
 gatherUsageStats = false
