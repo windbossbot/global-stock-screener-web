@@ -4,3 +4,4 @@ yfinance>=0.2.54
 requests>=2.32
 pykrx>=1.0.48
 finance-datareader>=0.9.96
+setuptools>=75
