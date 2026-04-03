@@ -1390,6 +1390,14 @@ def _numeric_series(df: pd.DataFrame, col: str) -> pd.Series:
     return pd.Series(index=df.index, dtype=float)
 
 
+def _truthy_flag_series(df: pd.DataFrame, col: str) -> pd.Series:
+    series = df.get(col)
+    if not isinstance(series, pd.Series):
+        return pd.Series(False, index=df.index)
+    text = series.astype("string").fillna("").str.strip().str.lower()
+    return text.isin(["1", "true", "t", "yes", "y"])
+
+
 def _compute_per_roe_ratio(per, roe_pct) -> Optional[float]:
     per_num = _safe_float(per)
     roe_num = _safe_float(roe_pct)
@@ -2537,6 +2545,7 @@ def build_filter_context(
     etf_mode: str,
     dividend_only: bool,
     dividend_cycles: List[str],
+    selected_conditions: List[str],
     tf_rule_map: Dict[str, str],
     near_tf_label: str,
     near_periods: List[int],
@@ -2558,6 +2567,8 @@ def build_filter_context(
         "etf_mode": normalize_etf_mode(etf_mode),
         "dividend_only": bool(dividend_only),
         "dividend_cycles": [str(x).strip() for x in dividend_cycles if str(x).strip()],
+        "selected_conditions": [str(x).strip() for x in selected_conditions if str(x).strip()],
+        "strict_metadata_prefilter": True,
         "tf_rules": tf_rules,
         "near_tf": near_tf,
         "near_periods": list(near_periods),
@@ -2591,17 +2602,30 @@ def prefilter_universe_fast(
     etf_mode: str,
     dividend_only: bool = False,
     dividend_cycles: Optional[List[str]] = None,
+    strict_metadata_prefilter: bool = True,
 ) -> pd.DataFrame:
     # Cheap string-based prefilter before network-heavy yfinance calls.
     if universe.empty:
         return universe
+
+    def should_enforce_strict(match_count: int, known_count: int, current_size: int) -> bool:
+        if not strict_metadata_prefilter:
+            return False
+        if match_count <= 0 or known_count <= 0 or current_size <= 0:
+            return False
+        if match_count >= 12:
+            return True
+        if match_count >= 5 and (known_count / max(1, current_size)) >= 0.25:
+            return True
+        return False
+
     out = universe.copy()
     etf_mode_norm = normalize_etf_mode(etf_mode)
     selected_cycles = [str(x).strip() for x in (dividend_cycles or []) if str(x).strip()]
     name_series = out["name"].fillna("").str.upper()
     etf_hint = pd.Series(False, index=out.index)
     if "is_etf_hint" in out.columns:
-        etf_hint = out["is_etf_hint"].fillna("").astype(str).str.strip().str.lower().isin(["1", "true", "t", "yes", "y"])
+        etf_hint = _truthy_flag_series(out, "is_etf_hint")
     etf_like = name_series.str.contains("ETF", regex=False) | etf_hint
     if etf_mode_norm == "ETF 포함":
         pass
@@ -2611,30 +2635,107 @@ def prefilter_universe_fast(
         out = out[~etf_like]
     if dividend_only and "is_dividend" in out.columns:
         known_div = out["is_dividend"].notna()
-        div_true = out["is_dividend"].fillna("").astype(str).str.strip().str.lower().isin(["1", "true", "t", "yes", "y"])
-        out = out[~known_div | div_true]
+        div_true = _truthy_flag_series(out, "is_dividend")
+        if should_enforce_strict(int(div_true.sum()), int(known_div.sum()), len(out)):
+            out = out[div_true]
+        else:
+            out = out[~known_div | div_true]
     if selected_cycles and "dividend_cycle" in out.columns:
         cycle = out["dividend_cycle"].fillna("").astype(str).str.strip()
         known_cycle = cycle.ne("")
-        out = out[~known_cycle | cycle.isin(selected_cycles)]
+        cycle_match = cycle.isin(selected_cycles)
+        if should_enforce_strict(int(cycle_match.sum()), int(known_cycle.sum()), len(out)):
+            out = out[cycle_match]
+        else:
+            out = out[~known_cycle | cycle_match]
     return out
+
+
+def prioritize_scan_candidates(universe: pd.DataFrame, ctx: Dict[str, object]) -> pd.DataFrame:
+    if universe.empty:
+        return universe
+    out = universe.copy()
+    name_series = out["name"].fillna("").astype(str).str.upper()
+    etf_hint = pd.Series(False, index=out.index)
+    if "is_etf_hint" in out.columns:
+        etf_hint = _truthy_flag_series(out, "is_etf_hint")
+    etf_like = name_series.str.contains("ETF", regex=False) | etf_hint
+    dividend_flag = pd.Series(False, index=out.index)
+    if "is_dividend" in out.columns:
+        dividend_flag = _truthy_flag_series(out, "is_dividend")
+    cycle = out.get("dividend_cycle", pd.Series("", index=out.index)).fillna("").astype(str).str.strip()
+    selected_cycles = [str(x).strip() for x in ctx.get("dividend_cycles", []) if str(x).strip()]
+    selected_conditions = [str(x).strip() for x in ctx.get("selected_conditions", []) if str(x).strip()]
+    scan_priority = pd.Series(0.0, index=out.index, dtype=float)
+
+    etf_mode = str(ctx.get("etf_mode", "ETF 포함"))
+    if etf_mode == "ETF 만":
+        scan_priority += etf_like.astype(float) * 5.0
+    elif etf_mode == "ETF 미포함":
+        scan_priority += (~etf_like).astype(float) * 3.0
+
+    if bool(ctx.get("dividend_only", False)):
+        scan_priority += dividend_flag.astype(float) * 6.0
+        scan_priority += cycle.ne("").astype(float) * 3.0
+
+    if selected_cycles:
+        cycle_bonus_map = {"월배당": 4.0, "분기배당": 3.0, "반기배당": 2.0, "연배당": 1.0}
+        scan_priority += cycle.isin(selected_cycles).astype(float) * 10.0
+        scan_priority += cycle.map(cycle_bonus_map).fillna(0.0)
+
+    if selected_conditions:
+        if "강한 상승 구조 (5>20>60>120)" in selected_conditions:
+            scan_priority += dividend_flag.astype(float) * 0.6
+        if "일반 상승 구조 (20>60>120)" in selected_conditions:
+            scan_priority += cycle.ne("").astype(float) * 0.4
+        if "하락 구조 제외 (주가<120MA 제거)" in selected_conditions:
+            scan_priority += etf_like.astype(float) * 0.2
+
+    out["_scan_priority"] = scan_priority
+    sort_cols = ["_scan_priority"]
+    ascending = [False]
+    if "market" in out.columns:
+        sort_cols.append("market")
+        ascending.append(True)
+    if "ticker" in out.columns:
+        sort_cols.append("ticker")
+        ascending.append(True)
+    out = out.sort_values(sort_cols, ascending=ascending, kind="stable").reset_index(drop=True)
+    return out.drop(columns=["_scan_priority"], errors="ignore")
 
 
 def apply_prefilter_pipeline(universe: pd.DataFrame, ctx: Dict[str, object]) -> Tuple[pd.DataFrame, Dict[str, int]]:
     out = universe.copy()
     counts = {"pre_input": len(out)}
+    strict_metadata_prefilter = bool(ctx.get("strict_metadata_prefilter", True))
     out = prefilter_universe_fast(
         out,
         str(ctx.get("etf_mode", "ETF 포함")),
-        dividend_only=bool(ctx.get("dividend_only", False)),
-        dividend_cycles=list(ctx.get("dividend_cycles", [])),
+        dividend_only=False,
+        dividend_cycles=[],
+        strict_metadata_prefilter=strict_metadata_prefilter,
     )
     counts["pre_etf"] = len(out)
-    counts["pre_dividend_cycle"] = len(out)
+    out = prefilter_universe_fast(
+        out,
+        "ETF 포함",
+        dividend_only=bool(ctx.get("dividend_only", False)),
+        dividend_cycles=[],
+        strict_metadata_prefilter=strict_metadata_prefilter,
+    )
     counts["pre_dividend_only"] = len(out)
+    out = prefilter_universe_fast(
+        out,
+        "ETF 포함",
+        dividend_only=False,
+        dividend_cycles=list(ctx.get("dividend_cycles", [])),
+        strict_metadata_prefilter=strict_metadata_prefilter,
+    )
+    counts["pre_dividend_cycle"] = len(out)
     if ("price" in out.columns) or ("price_krw" in out.columns):
         out = apply_price_filter(out, float(ctx.get("min_price", 0.0)), float(ctx.get("max_price", 0.0)))
     counts["pre_price"] = len(out)
+    out = prioritize_scan_candidates(out, ctx)
     return out, counts
 
 
@@ -2676,7 +2777,7 @@ def apply_dividend_filter(df: pd.DataFrame, dividend_only: bool, dividend_cycles
     has_cycle = cycle.notna() if isinstance(cycle, pd.Series) else pd.Series(False, index=out.index)
     has_div_flag = pd.Series(False, index=out.index)
     if "is_dividend" in out.columns:
-        has_div_flag = out["is_dividend"].fillna("").astype(str).str.strip().str.lower().isin(["1", "true", "t", "yes", "y"])
+        has_div_flag = _truthy_flag_series(out, "is_dividend")
     has_div = (dy > 0).fillna(False) | has_cycle | has_div_flag
     if dividend_only:
         out = out[has_div]
@@ -2829,6 +2930,14 @@ def enrich_score(df: pd.DataFrame) -> pd.DataFrame:
         + has_dividend.astype(int)
         + cycle_bonus.ge(0.8).astype(int)
         + out["valuation_score"].ge(0.65).astype(int)
+    )
+    out["search_priority"] = (
+        out["priority_bucket"].astype(float)
+        + out["dividend_score"].ge(0.72).astype(float) * 1.2
+        + out["trend_score"].ge(0.55).astype(float) * 1.5
+        + out["valuation_score"].ge(0.60).astype(float) * 0.9
+        + cycle_bonus.ge(0.8).astype(float) * 0.8
+        + out["liquidity_score"].ge(0.55).astype(float) * 0.4
     )
     out["score"] = (
         (out["trend_score"] * 0.42)
@@ -3293,6 +3402,7 @@ def main() -> None:
             etf_mode=run_etf_mode,
             dividend_only=run_dividend_only,
             dividend_cycles=run_dividend_cycles,
+            selected_conditions=run_selected_conditions,
             tf_rule_map=run_tf_rule_map,
             near_tf_label=run_near_tf_label,
             near_periods=run_near_periods,
@@ -3435,12 +3545,14 @@ def main() -> None:
             filtered["score"] = pd.Series([0.0] * len(filtered), index=filtered.index, dtype=float)
         if "priority_bucket" not in filtered.columns:
             filtered["priority_bucket"] = pd.Series([0.0] * len(filtered), index=filtered.index, dtype=float)
+        if "search_priority" not in filtered.columns:
+            filtered["search_priority"] = pd.Series([0.0] * len(filtered), index=filtered.index, dtype=float)
         if "dividend_yield_pct" not in filtered.columns:
             filtered["dividend_yield_pct"] = pd.Series([0.0] * len(filtered), index=filtered.index, dtype=float)
         t_sort0 = time.time()
         filtered = filtered.sort_values(
-            ["priority_bucket", "score", "dividend_yield_pct", "roe_pct"],
-            ascending=[False, False, False, False],
+            ["search_priority", "priority_bucket", "score", "dividend_yield_pct", "roe_pct"],
+            ascending=[False, False, False, False, False],
             na_position="last",
         )
         scan_stats["t_sort_sec"] = round(time.time() - t_sort0, 2)
