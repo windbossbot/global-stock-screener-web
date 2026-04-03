@@ -43,6 +43,10 @@ Updated: 2026-04-03
 2. runtime config:
    - `C:\Users\KGWPC\workspace\dividend-screener-v3\requirements.txt`
    - `C:\Users\KGWPC\workspace\dividend-screener-v3\.streamlit\config.toml`
+   - `C:\Users\KGWPC\workspace\dividend-screener-v3\web_local_common.ps1`
+   - `C:\Users\KGWPC\workspace\dividend-screener-v3\run_web.ps1`
+   - `C:\Users\KGWPC\workspace\dividend-screener-v3\run_web_keepalive.ps1`
+   - `C:\Users\KGWPC\workspace\dividend-screener-v3\stop_web.ps1`
 3. existing root reference docs:
    - `C:\Users\KGWPC\workspace\dividend-screener-v3\README.md`
 

@@ -9,6 +9,7 @@ Updated: 2026-04-03
 - 루트 문서는 `README.md` 중심으로 정리했고, 오래된 복구/범위/배포 문서는 제거했다.
 - 앱 코드는 Google 제거, CSV 저장, 재무 필터, 우선순위 정렬, HTTP 세션 재사용, 로컬 스냅샷 캐시 기준으로 갱신했다.
 - 운영 기준은 외부 무료 호스팅이 아니라 로컬 실행으로 확정했다.
+- 로컬 실행 스크립트는 `run_web.ps1`, `run_web_keepalive.ps1`, `stop_web.ps1` 기준으로 정리했다.
 
 ## 2. What The Next Session Should Read First
 

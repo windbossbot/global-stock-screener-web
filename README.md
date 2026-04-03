@@ -23,8 +23,18 @@ powershell -ExecutionPolicy Bypass -File .\run_web.ps1
 powershell -ExecutionPolicy Bypass -File .\run_web_keepalive.ps1
 ```
 
+중지:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\stop_web.ps1
+```
+
 기본 접속 주소:
 - `http://127.0.0.1:8501`
+
+실행 동작:
+- 이미 앱이 떠 있으면 브라우저만 다시 엽니다.
+- `requirements.txt` 가 바뀐 경우에만 패키지를 다시 설치합니다.
+- 처음 기동되면 브라우저를 자동으로 엽니다.
 
 ## 운영 기준
 - 외부 무료 호스팅은 cold start, 휘발성 파일시스템(ephemeral filesystem), 장시간 조건검색 시 자원 제약 때문에 현재 프로젝트 기준으로 사용하지 않습니다.

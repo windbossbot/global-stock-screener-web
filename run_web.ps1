@@ -2,16 +2,14 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 Set-Location -Path $PSScriptRoot
+. (Join-Path $PSScriptRoot "web_local_common.ps1")
 
-if (-not (Test-Path ".venv")) {
-  python -m venv .venv
+if (Test-AppHttpReady) {
+  Start-Process $script:AppUrl | Out-Null
+  Write-Host "[run] already running: $($script:AppUrl)"
+  exit 0
 }
 
-$py = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
-if (-not (Test-Path $py)) {
-  throw "python.exe not found in .venv"
-}
-
-& $py -m pip install --upgrade pip
-& $py -m pip install -r requirements.txt
-& $py -m streamlit run app.py --server.headless true --server.address 127.0.0.1 --server.port 8501 --server.fileWatcherType none --runner.fastReruns true
+Ensure-AppPython
+Open-AppBrowserWhenReady
+& $script:PythonExe -m streamlit run app.py --server.headless true --server.address $script:AppHost --server.port $script:AppPort --server.fileWatcherType none --runner.fastReruns true

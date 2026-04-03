@@ -18,6 +18,7 @@ Updated: 2026-04-03
 - Google Sheets 업로드는 제거되었고, 결과는 `_cache/exports` 에 CSV로 저장됩니다.
 - `Yahoo` 호출은 세션 재사용과 로컬 스냅샷 캐시를 우선 사용하도록 정리했습니다.
 - 현재 운영 기준은 로컬 실행 전용이며, 루트 참고 문서는 `README.md` 중심으로 유지합니다.
+- 로컬 실행 스크립트는 `run_web.ps1`, `run_web_keepalive.ps1`, `stop_web.ps1` 기준으로 사용합니다.
 - Git 기준은 이 폴더 하나로 복구/통일하는 것이 원칙입니다.
 
 ## Pull Next Only If Needed
