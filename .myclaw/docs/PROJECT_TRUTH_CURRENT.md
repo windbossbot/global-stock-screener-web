@@ -16,6 +16,8 @@ Updated: 2026-04-03
 5. Git 기준은 이 폴더의 정상 `.git` 디렉터리 하나이며, 캐시/가상환경은 추적 대상이 아니다.
 6. `Yahoo` 재무/배당 조회는 HTTP 세션 재사용과 로컬 CSV 스냅샷 캐시를 함께 사용한다.
 7. 현재 운영 모드는 외부 무료 호스팅이 아니라 로컬 실행 전용이다.
+8. 사용자 수동 업로드 파일은 `user_uploads` 폴더로 모으고, 루트에 직접 두지 않는다.
+9. 현재 `US 월배당`은 유니버스 메타가 비어 있어 `통합 월배당` 검색에서 누락될 수 있다.
 
 ## 3. Main Paths
 
@@ -49,6 +51,8 @@ Updated: 2026-04-03
    - `C:\Users\KGWPC\workspace\dividend-screener-v3\stop_web.ps1`
 3. existing root reference docs:
    - `C:\Users\KGWPC\workspace\dividend-screener-v3\README.md`
+4. local manual upload area:
+   - `C:\Users\KGWPC\workspace\dividend-screener-v3\user_uploads`
 
 ## 5. Docs Ownership
 

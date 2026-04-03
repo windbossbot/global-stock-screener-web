@@ -36,10 +36,15 @@ powershell -ExecutionPolicy Bypass -File .\stop_web.ps1
 - `requirements.txt` 가 바뀐 경우에만 패키지를 다시 설치합니다.
 - 처음 기동되면 브라우저를 자동으로 엽니다.
 
+업로드/참고 파일:
+- 사용자가 넣은 CSV/참고 자료는 `user_uploads/` 아래로 모아둡니다.
+- 루트에 떨어진 임시 업로드 파일은 이 폴더로 정리하는 기준을 사용합니다.
+
 ## 운영 기준
 - 외부 무료 호스팅은 cold start, 휘발성 파일시스템(ephemeral filesystem), 장시간 조건검색 시 자원 제약 때문에 현재 프로젝트 기준으로 사용하지 않습니다.
 - 결과 저장은 `_cache/exports/latest_screener.csv` 와 타임스탬프 CSV 기준입니다.
 - `KRX Open API` 키는 `_cache/krx_api_key.txt` 또는 앱 사이드바 설정에서 관리합니다.
+- 현재 `US 월배당`은 별도 메타 소스를 아직 붙이지 않아, `통합 월배당` 검색 시 KR 쪽이 우선 반영됩니다.
 
 ## KRX Open API (선택)
 - 앱 사이드바 `KRX Open API 설정`에서 키 저장/테스트 가능

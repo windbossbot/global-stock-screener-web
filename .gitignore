@@ -6,4 +6,6 @@ _cache/
 .myclaw/output/
 .myclaw/runs/
 .myclaw/smoke/
+user_uploads/*
+!user_uploads/README.md
 *.pyc
