@@ -6,8 +6,8 @@ Updated: 2026-04-03
 
 - `2026-04-03` 에 공유 스크립트 `C:\Users\KGWPC\workspace\myclaw\scripts\bootstrap_myclaw_nest.py` 로 프로젝트 로컬 `.myclaw` nest 를 생성했다.
 - 루트 `AGENTS.md` 가 이제 `.myclaw` 기반 current truth 읽기 순서를 가리킨다.
-- 루트 문서는 `README.md`, `DEPLOY_WEB.md` 중심으로 정리했고, 오래된 복구/범위 문서는 제거 대상이다.
-- 앱 코드는 Google 제거, CSV 저장, 재무 필터, 우선순위 정렬 기준으로 갱신했다.
+- 루트 문서는 `README.md`, `DEPLOY_WEB.md` 중심으로 정리했고, 오래된 복구/범위 문서는 제거했다.
+- 앱 코드는 Google 제거, CSV 저장, 재무 필터, 우선순위 정렬, HTTP 세션 재사용, 로컬 스냅샷 캐시 기준으로 갱신했다.
 
 ## 2. What The Next Session Should Read First
 
@@ -22,7 +22,8 @@ Updated: 2026-04-03
 1. `app.py` 에는 배당 전용, 배당 주기, `K-ETF` 배당 메타, `pykrx` 기반 흐름이 들어 있다.
 2. `app.py` 에는 `ROE`, `EV/EBITDA`, `PER`, `PER/ROE` 구현이 들어 있다.
 3. Google Sheets 관련 코드는 제거되었고, 결과는 CSV로 저장된다.
-4. Git 메타데이터는 이 폴더 기준 하나로 복구/통일하는 방향이 맞다.
+4. 재무/배당 스냅샷은 `_cache` 아래 로컬 CSV 캐시를 우선 사용한다.
+5. Git 메타데이터는 이 폴더 기준 하나로 복구/통일하는 방향이 맞다.
 
 ## 4. Non-Destructive Connection Direction
 

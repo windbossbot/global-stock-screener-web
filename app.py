@@ -9,7 +9,9 @@ from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
 import streamlit as st
+from urllib3.util.retry import Retry
 # yfinance cache dir should be set before import when possible.
 try:
     _pre_yf_cache = (Path(__file__).resolve().parent / "_cache" / "yf_cache")
@@ -84,6 +86,8 @@ KR_SECTOR_MASTER_PATH = CACHE_DIR / "kr_sector_master.csv"
 FILTERS_PATH = CACHE_DIR / "saved_filters.json"
 RESULT_EXPORT_DIR = CACHE_DIR / "exports"
 RESULT_EXPORT_LATEST_PATH = RESULT_EXPORT_DIR / "latest_screener.csv"
+VALUATION_CACHE_PATH = CACHE_DIR / "valuation_cache.csv"
+QUOTE_CACHE_PATH = CACHE_DIR / "quote_snapshot_cache.csv"
 KRX_OPENAPI_ENDPOINTS = [
     ("KOSPI", "https://data.krx.co.kr/svc/apis/sto/stk_bydd_trd"),
     ("KOSDAQ", "https://data.krx.co.kr/svc/apis/sto/ksq_bydd_trd"),
@@ -91,6 +95,9 @@ KRX_OPENAPI_ENDPOINTS = [
 ]
 KETF_LINEUP_URL = "https://www.k-etf.com/api/v0/lineup/etf/in/market_temp?code=XKRX&lang=ko"
 KETF_DIVIDEND_RANK_URL = "https://www.k-etf.com/api/v0/performance/etf/orderby/dividend?market=XKRX&limit={limit}&lang=ko"
+HTTP_HEADERS = {"User-Agent": "Mozilla/5.0"}
+_http_session_lock = threading.Lock()
+_http_session: Optional[requests.Session] = None
 try:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     yf.set_tz_cache_location(str(CACHE_DIR / "yf_tz_cache"))
@@ -100,6 +107,38 @@ try:
     yf_cache.set_cache_location(str(yf_cache_dir))
 except Exception:
     pass
+
+
+def get_http_session() -> requests.Session:
+    global _http_session
+    with _http_session_lock:
+        if _http_session is None:
+            session = requests.Session()
+            retry = Retry(
+                total=2,
+                connect=2,
+                read=2,
+                status=2,
+                backoff_factor=0.4,
+                status_forcelist=[429, 500, 502, 503, 504],
+                allowed_methods=frozenset(["GET", "POST"]),
+                respect_retry_after_header=True,
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(max_retries=retry, pool_connections=32, pool_maxsize=32)
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            session.headers.update(HTTP_HEADERS)
+            _http_session = session
+    return _http_session
+
+
+def http_get(url: str, **kwargs) -> requests.Response:
+    return get_http_session().get(url, **kwargs)
+
+
+def http_post(url: str, **kwargs) -> requests.Response:
+    return get_http_session().post(url, **kwargs)
 
 
 def _read_pipe_table(text: str) -> pd.DataFrame:
@@ -146,6 +185,49 @@ def save_universe_cache(df: pd.DataFrame, path: Path) -> None:
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         df.to_csv(path, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
+
+
+def load_snapshot_cache(path: Path, ttl_hours: int, value_cols: List[str]) -> pd.DataFrame:
+    empty = pd.DataFrame(columns=["yf_ticker"] + list(value_cols))
+    try:
+        if not _is_cache_fresh(path, ttl_hours):
+            return empty
+        cached = pd.read_csv(path)
+        if cached is None or cached.empty or "yf_ticker" not in cached.columns:
+            return empty
+        out = cached.copy()
+        out["yf_ticker"] = out["yf_ticker"].astype(str).str.strip()
+        out = out[out["yf_ticker"].ne("")]
+        for col in value_cols:
+            if col not in out.columns:
+                out[col] = pd.Series(dtype=float)
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+        return out[["yf_ticker"] + list(value_cols)].drop_duplicates(subset=["yf_ticker"], keep="last")
+    except Exception:
+        return empty
+
+
+def save_snapshot_cache(path: Path, fresh_df: pd.DataFrame, value_cols: List[str], keep_hours: int = 72) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        fresh = fresh_df.copy()
+        if fresh.empty or "yf_ticker" not in fresh.columns:
+            return
+        fresh["yf_ticker"] = fresh["yf_ticker"].astype(str).str.strip()
+        fresh = fresh[fresh["yf_ticker"].ne("")]
+        for col in value_cols:
+            if col not in fresh.columns:
+                fresh[col] = pd.Series(dtype=float)
+            fresh[col] = pd.to_numeric(fresh[col], errors="coerce")
+        base = load_snapshot_cache(path, keep_hours, value_cols)
+        frames = [fresh[["yf_ticker"] + list(value_cols)]]
+        if not base.empty:
+            frames.insert(0, base)
+        merged = pd.concat(frames, ignore_index=True)
+        merged = merged.drop_duplicates(subset=["yf_ticker"], keep="last")
+        save_universe_cache(merged, path)
     except Exception:
         pass
 
@@ -259,7 +341,7 @@ def get_kr_etf_universe_ketf(force_refresh: bool = False) -> pd.DataFrame:
         if not cached.empty and _is_cache_fresh(KR_ETF_CACHE_PATH, 24):
             return cached
     try:
-        r = requests.get(KETF_LINEUP_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        r = http_get(KETF_LINEUP_URL, timeout=20, headers=HTTP_HEADERS)
         r.raise_for_status()
         js = r.json()
         rows: List[Dict] = []
@@ -296,7 +378,7 @@ def get_kr_etf_dividend_meta(force_refresh: bool = False, limit: int = 2000) -> 
             return cached
     try:
         url = KETF_DIVIDEND_RANK_URL.format(limit=max(500, int(limit)))
-        r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        r = http_get(url, timeout=20, headers=HTTP_HEADERS)
         r.raise_for_status()
         js = r.json()
         rows: List[Dict] = []
@@ -491,7 +573,7 @@ def test_krx_api_key(key: str) -> Tuple[bool, str]:
         ok_any = False
         for market_name, url in KRX_OPENAPI_ENDPOINTS:
             try:
-                r = requests.get(
+                r = http_get(
                     url,
                     headers={"AUTH_KEY": k, "User-Agent": "Mozilla/5.0"},
                     params={"basDd": bas_dd},
@@ -517,7 +599,7 @@ def _krx_openapi_list_by_date(api_key: str, bas_dd: str) -> pd.DataFrame:
     frames: List[pd.DataFrame] = []
     for market_name, url in KRX_OPENAPI_ENDPOINTS:
         try:
-            r = requests.get(url, headers=headers, params=params, timeout=12)
+            r = http_get(url, headers=headers, params=params, timeout=12)
             if r.status_code != 200:
                 continue
             js = r.json()
@@ -611,7 +693,7 @@ def get_kr_universe_from_krx_finder() -> pd.DataFrame:
     payload = {"bld": "dbms/comm/finder/finder_stkisu"}
     for url in endpoints:
         try:
-            r = requests.post(url, data=payload, headers=headers, timeout=12)
+            r = http_post(url, data=payload, headers=headers, timeout=12)
             if r.status_code != 200:
                 continue
             js = r.json()
@@ -658,7 +740,7 @@ def get_kr_sector_map_krx() -> pd.DataFrame:
         "Referer": "https://data.krx.co.kr/contents/MDC/MDI/outerLoader/index.cmd",
     }
     try:
-        date_meta = requests.get(
+        date_meta = http_get(
             "http://data.krx.co.kr/comm/bldAttendant/executeForResourceBundle.cmd?baseName=krx.mdc.i18n.component&key=B128.bld",
             headers=headers,
             timeout=10,
@@ -683,7 +765,7 @@ def get_kr_sector_map_krx() -> pd.DataFrame:
             "csvxls_isNo": "false",
         }
         try:
-            r = requests.post(
+            r = http_post(
                 "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd",
                 headers=headers,
                 data=payload,
@@ -903,7 +985,7 @@ def get_sector_seed_map() -> pd.DataFrame:
 
 def probe_endpoint(url: str, timeout_sec: int = 8) -> str:
     try:
-        r = requests.get(url, timeout=timeout_sec)
+        r = http_get(url, timeout=timeout_sec)
         return f"HTTP {r.status_code}"
     except Exception as e:
         return f"ERR: {e}"
@@ -915,7 +997,7 @@ def get_us_universe() -> pd.DataFrame:
     # Primary: Nasdaq Trader symbol directory
     try:
         for url in US_LISTING_URLS:
-            resp = requests.get(url, timeout=20)
+            resp = http_get(url, timeout=20)
             resp.raise_for_status()
             df = _read_pipe_table(resp.text)
             if df.empty:
@@ -1236,7 +1318,7 @@ def diagnose_kr_sources(key_hint: str = "") -> List[Dict[str, str]]:
 def get_usdkrw() -> Optional[float]:
     for url in USDKRW_APIS:
         try:
-            r = requests.get(url, timeout=10)
+            r = http_get(url, timeout=10)
             r.raise_for_status()
             d = r.json()
             if "rates" in d and "KRW" in d["rates"]:
@@ -1723,7 +1805,7 @@ def _fetch_sector_single(yf_ticker: str, market: str, ticker: str) -> Tuple[str,
     for i in range(2):
         try:
             u = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{yf_ticker}?modules=assetProfile"
-            r = requests.get(u, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
+            r = http_get(u, timeout=8, headers=HTTP_HEADERS)
             r.raise_for_status()
             d = r.json()
             result = (((d or {}).get("quoteSummary") or {}).get("result") or [{}])[0]
@@ -1744,11 +1826,11 @@ def fetch_valuation_snapshot(yf_ticker: str) -> Dict[str, Optional[float]]:
         "https://query1.finance.yahoo.com/v10/finance/quoteSummary",
     ]
     params = {"modules": "financialData,defaultKeyStatistics,summaryDetail"}
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = HTTP_HEADERS
     for base in endpoints:
         for retry in range(2):
             try:
-                r = requests.get(f"{base}/{yf_ticker}", params=params, timeout=8, headers=headers)
+                r = http_get(f"{base}/{yf_ticker}", params=params, timeout=8, headers=headers)
                 r.raise_for_status()
                 d = r.json()
                 result = (((d or {}).get("quoteSummary") or {}).get("result") or [{}])[0]
@@ -1787,18 +1869,29 @@ def enrich_valuation_metrics(
     need_ev: bool = False,
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
     if df.empty:
-        return df, {"valuation_targets": 0.0, "valuation_timeout": 0.0, "valuation_per_filled": 0.0, "valuation_roe_filled": 0.0, "valuation_ev_filled": 0.0}
+        return df, {"valuation_targets": 0.0, "valuation_timeout": 0.0, "valuation_cache_hits": 0.0, "valuation_per_filled": 0.0, "valuation_roe_filled": 0.0, "valuation_ev_filled": 0.0}
     if not any([need_per, need_roe, need_ev]):
         out = df.copy()
         per_series = _numeric_series(out, "per")
         roe_series = _numeric_series(out, "roe_pct")
         out["per_roe_ratio"] = (per_series / roe_series).where(per_series.notna() & roe_series.notna() & (roe_series != 0))
-        return out, {"valuation_targets": 0.0, "valuation_timeout": 0.0, "valuation_per_filled": 0.0, "valuation_roe_filled": 0.0, "valuation_ev_filled": 0.0}
+        return out, {"valuation_targets": 0.0, "valuation_timeout": 0.0, "valuation_cache_hits": 0.0, "valuation_per_filled": 0.0, "valuation_roe_filled": 0.0, "valuation_ev_filled": 0.0}
 
     out = df.copy()
     before_per = int(_numeric_series(out, "per").notna().sum())
     before_roe = int(_numeric_series(out, "roe_pct").notna().sum())
     before_ev = int(_numeric_series(out, "ev_to_ebitda").notna().sum())
+    cache_cols = ["per", "roe_pct", "per_roe_ratio", "ev_to_ebitda"]
+    cache_hits = 0
+
+    cache_df = load_snapshot_cache(VALUATION_CACHE_PATH, 24, cache_cols)
+    if not cache_df.empty:
+        cache_key = cache_df.set_index("yf_ticker")
+        for col in cache_cols:
+            fill = out["yf_ticker"].map(cache_key[col]) if col in cache_key.columns else pd.Series(index=out.index, dtype=float)
+            prev_count = int(_numeric_series(out, col).notna().sum())
+            out[col] = _numeric_series(out, col).where(_numeric_series(out, col).notna(), pd.to_numeric(fill, errors="coerce"))
+            cache_hits += max(0, int(_numeric_series(out, col).notna().sum()) - prev_count)
 
     need_mask = pd.Series(False, index=out.index)
     if need_per:
@@ -1838,6 +1931,19 @@ def enrich_valuation_metrics(
                         value_map[yf_ticker] = {"per": None, "roe_pct": None, "per_roe_ratio": None, "ev_to_ebitda": None}
 
         if value_map:
+            fresh_cache_rows = []
+            for yf_ticker, payload in value_map.items():
+                fresh_cache_rows.append(
+                    {
+                        "yf_ticker": yf_ticker,
+                        "per": payload.get("per"),
+                        "roe_pct": payload.get("roe_pct"),
+                        "per_roe_ratio": payload.get("per_roe_ratio"),
+                        "ev_to_ebitda": payload.get("ev_to_ebitda"),
+                    }
+                )
+            if fresh_cache_rows:
+                save_snapshot_cache(VALUATION_CACHE_PATH, pd.DataFrame(fresh_cache_rows), cache_cols, keep_hours=72)
             if need_per:
                 per_fill = out["yf_ticker"].map({k: v.get("per") for k, v in value_map.items()})
                 out["per"] = _numeric_series(out, "per").where(_numeric_series(out, "per").notna(), per_fill)
@@ -1853,6 +1959,7 @@ def enrich_valuation_metrics(
         return out, {
             "valuation_targets": float(len(targets)),
             "valuation_timeout": float(timeout_count),
+            "valuation_cache_hits": float(cache_hits),
             "valuation_per_filled": float(max(0, int(_numeric_series(out, "per").notna().sum()) - before_per)),
             "valuation_roe_filled": float(max(0, int(_numeric_series(out, "roe_pct").notna().sum()) - before_roe)),
             "valuation_ev_filled": float(max(0, int(_numeric_series(out, "ev_to_ebitda").notna().sum()) - before_ev)),
@@ -1861,7 +1968,7 @@ def enrich_valuation_metrics(
     per_series = _numeric_series(out, "per")
     roe_series = _numeric_series(out, "roe_pct")
     out["per_roe_ratio"] = (per_series / roe_series).where(per_series.notna() & roe_series.notna() & (roe_series != 0))
-    return out, {"valuation_targets": 0.0, "valuation_timeout": 0.0, "valuation_per_filled": 0.0, "valuation_roe_filled": 0.0, "valuation_ev_filled": 0.0}
+    return out, {"valuation_targets": 0.0, "valuation_timeout": 0.0, "valuation_cache_hits": float(cache_hits), "valuation_per_filled": float(max(0, int(_numeric_series(out, "per").notna().sum()) - before_per)), "valuation_roe_filled": float(max(0, int(_numeric_series(out, "roe_pct").notna().sum()) - before_roe)), "valuation_ev_filled": float(max(0, int(_numeric_series(out, "ev_to_ebitda").notna().sum()) - before_ev))}
 
 
 def enrich_dividend_from_quote(df: pd.DataFrame) -> pd.DataFrame:
@@ -1881,7 +1988,7 @@ def enrich_dividend_from_quote(df: pd.DataFrame) -> pd.DataFrame:
         syms = targets[i:i + chunk]
         try:
             url = "https://query1.finance.yahoo.com/v7/finance/quote"
-            r = requests.get(url, params={"symbols": ",".join(syms)}, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+            r = http_get(url, params={"symbols": ",".join(syms)}, timeout=12, headers=HTTP_HEADERS)
             r.raise_for_status()
             js = r.json()
             results = (((js or {}).get("quoteResponse") or {}).get("result") or [])
@@ -1919,6 +2026,23 @@ def enrich_quote_snapshot(
         return out, {"quote_targets": 0.0, "quote_div_filled": 0.0}
 
     before_div = int(pd.to_numeric(out.get("dividend_yield_pct"), errors="coerce").notna().sum())
+    cache_hits = 0
+    quote_cache = load_snapshot_cache(QUOTE_CACHE_PATH, 12, ["dividend_yield_pct"])
+    if not quote_cache.empty:
+        quote_key = quote_cache.set_index("yf_ticker")
+        fill_cached = out["yf_ticker"].map(quote_key["dividend_yield_pct"])
+        prev_div = int(pd.to_numeric(out.get("dividend_yield_pct"), errors="coerce").notna().sum())
+        out["dividend_yield_pct"] = pd.to_numeric(out.get("dividend_yield_pct"), errors="coerce").where(
+            pd.to_numeric(out.get("dividend_yield_pct"), errors="coerce").notna(),
+            pd.to_numeric(fill_cached, errors="coerce"),
+        )
+        cache_hits = max(0, int(pd.to_numeric(out.get("dividend_yield_pct"), errors="coerce").notna().sum()) - prev_div)
+        remaining_mask = pd.to_numeric(out.get("dividend_yield_pct"), errors="coerce").isna()
+        targets = out.loc[remaining_mask, "yf_ticker"].dropna().astype(str).unique().tolist()
+        if limit > 0:
+            targets = targets[: int(limit)]
+    if not targets:
+        return out, {"quote_targets": 0.0, "quote_cache_hits": float(cache_hits), "quote_div_filled": float(max(0, int(pd.to_numeric(out.get("dividend_yield_pct"), errors="coerce").notna().sum()) - before_div))}
 
     dy_map: Dict[str, float] = {}
     endpoints = [
@@ -1932,11 +2056,11 @@ def enrich_quote_snapshot(
         for ep in endpoints:
             for retry in range(2):
                 try:
-                    r = requests.get(
+                    r = http_get(
                         ep,
                         params={"symbols": ",".join(syms)},
                         timeout=12,
-                        headers={"User-Agent": "Mozilla/5.0"},
+                        headers=HTTP_HEADERS,
                     )
                     r.raise_for_status()
                     js = r.json()
@@ -2000,6 +2124,13 @@ def enrich_quote_snapshot(
                 continue
 
     if dy_map:
+        save_snapshot_cache(
+            QUOTE_CACHE_PATH,
+            pd.DataFrame([{"yf_ticker": k, "dividend_yield_pct": v} for k, v in dy_map.items()]),
+            ["dividend_yield_pct"],
+            keep_hours=36,
+        )
+    if dy_map:
         fill_dy = out["yf_ticker"].map(dy_map)
         out["dividend_yield_pct"] = pd.to_numeric(out.get("dividend_yield_pct"), errors="coerce").where(
             pd.to_numeric(out.get("dividend_yield_pct"), errors="coerce").notna(),
@@ -2009,6 +2140,7 @@ def enrich_quote_snapshot(
     after_div = int(pd.to_numeric(out.get("dividend_yield_pct"), errors="coerce").notna().sum())
     stats = {
         "quote_targets": float(len(targets)),
+        "quote_cache_hits": float(cache_hits),
         "quote_div_filled": float(max(0, after_div - before_div)),
         "quote_fallback_used": float(fallback_used),
     }
@@ -2941,7 +3073,7 @@ def main() -> None:
 
         st.divider()
         with st.expander("고급 옵션", expanded=False):
-            workers = st.slider("병렬 스레드 (권장 4~6)", 2, 12, 6, 1)
+            workers = st.slider("병렬 스레드 (권장 4~6)", 2, 12, 5, 1)
             speed_mode = st.toggle("고속 모드 (기본 ON)", value=True, help="ON: 속도 우선, 일부 상세 정보 호출 최소화")
             history_period = st.selectbox("조회 기간", ["2y", "3y", "5y"], index=0, help="고속 모드에서 짧을수록 빠름")
             sector_scoring = st.toggle("섹터 강도 점수화", value=True, help="섹터별 52주 신고가 개수 기반 가점")
@@ -2949,8 +3081,8 @@ def main() -> None:
             sector_pick_label = st.selectbox("섹터 보강 개수", ["상위 50", "상위 100", "상위 200", "상위 400", "전체"], index=1)
             sector_limit_map = {"상위 50": 50, "상위 100": 100, "상위 200": 200, "상위 400": 400, "전체": 0}
             sector_fetch_limit = sector_limit_map.get(sector_pick_label, 100)
-            sector_workers = st.slider("섹터 수집 스레드", 1, 8, 4, 1)
-            sector_max_seconds = st.slider("섹터 수집 최대시간(초)", 30, 1800, 180, 30)
+            sector_workers = st.slider("섹터 수집 스레드", 1, 8, 3, 1)
+            sector_max_seconds = st.slider("섹터 수집 최대시간(초)", 30, 1800, 120, 30)
             max_symbols = st.number_input("최대 스캔 수 (0=전체)", 0, 20000, 0, 100)
 
         st.divider()

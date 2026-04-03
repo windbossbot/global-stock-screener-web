@@ -13,7 +13,8 @@ Updated: 2026-04-03
 2. `app.py` 에는 `dividend_only`, `dividend_cycles`, `K-ETF` 배당 메타, `pykrx` 기반 배당 보강 경로가 들어 있다.
 3. `app.py` 에는 `PER`, `ROE`, `PER/ROE`, `EV/EBITDA` 재무 필터와 우선순위 정렬 로직이 들어 있다.
 4. 결과 저장은 `_cache/exports/latest_screener.csv` 와 타임스탬프 CSV를 기준으로 한다.
-5. Git 기준은 이 폴더의 정상 `.git` 디렉터리 하나로 복구되어야 하며, 캐시/가상환경은 추적 대상이 아니다.
+5. Git 기준은 이 폴더의 정상 `.git` 디렉터리 하나이며, 캐시/가상환경은 추적 대상이 아니다.
+6. `Yahoo` 재무/배당 조회는 HTTP 세션 재사용과 로컬 CSV 스냅샷 캐시를 함께 사용한다.
 
 ## 3. Main Paths
 
@@ -31,8 +32,6 @@ Updated: 2026-04-03
    - `C:\Users\KGWPC\workspace\dividend-screener-v3\.myclaw\smoke`
 7. local output root:
    - `C:\Users\KGWPC\workspace\dividend-screener-v3\.myclaw\output`
-8. local backups root:
-   - `C:\Users\KGWPC\workspace\dividend-screener-v3\.myclaw\backups`
 9. shared engine root:
    - `C:\Users\KGWPC\workspace\myclaw`
 
@@ -56,7 +55,7 @@ Updated: 2026-04-03
    - `C:\Users\KGWPC\workspace\dividend-screener-v3\.myclaw\state`
 3. root docs are still useful as reference, but they are no longer the default truth root
 4. `README.md` 는 현재 로컬 실행 경로와 CSV/재무 필터 기준으로 갱신되었다
-5. 오래된 복구/범위 문서는 제거하고 `.myclaw\backups` 에만 남긴다
+5. 오래된 복구/범위 문서는 제거하고 current truth 만 유지한다
 6. 공유 엔진 `C:\Users\KGWPC\workspace\myclaw` 는 재사용 script/template/helper 원천이지, 이 프로젝트의 기본 truth 루트가 아니다
 
 ## 6. Practical Rule
