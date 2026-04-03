@@ -34,6 +34,8 @@ powershell -ExecutionPolicy Bypass -File .\stop_web.ps1
 실행 동작:
 - 이미 앱이 떠 있으면 브라우저만 다시 엽니다.
 - `requirements.txt` 가 바뀐 경우에만 패키지를 다시 설치합니다.
+- 기본 실행은 `숨김 background worker` 로 떠서 CMD/PowerShell 창이 남지 않습니다.
+- `stop_web.ps1` 는 앱 Python 프로세스와 숨김 worker 를 함께 종료합니다.
 - 처음 기동되면 브라우저를 자동으로 엽니다.
 
 업로드/참고 파일:
@@ -44,7 +46,7 @@ powershell -ExecutionPolicy Bypass -File .\stop_web.ps1
 - 외부 무료 호스팅은 cold start, 휘발성 파일시스템(ephemeral filesystem), 장시간 조건검색 시 자원 제약 때문에 현재 프로젝트 기준으로 사용하지 않습니다.
 - 결과 저장은 `_cache/exports/latest_screener.csv` 와 타임스탬프 CSV 기준입니다.
 - `KRX Open API` 키는 `_cache/krx_api_key.txt` 또는 앱 사이드바 설정에서 관리합니다.
-- 현재 `US 월배당`은 별도 메타 소스를 아직 붙이지 않아, `통합 월배당` 검색 시 KR 쪽이 우선 반영됩니다.
+- `US 월배당`은 전용 메타 소스가 아직 약해 `KR`보다 탐색 효율이 낮지만, 현재는 선필터에서 미국 종목이 통째로 탈락하지 않도록 조정했습니다.
 
 ## KRX Open API (선택)
 - 앱 사이드바 `KRX Open API 설정`에서 키 저장/테스트 가능

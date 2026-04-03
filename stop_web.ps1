@@ -6,7 +6,7 @@ Set-Location -Path $PSScriptRoot
 
 $count = Stop-AppProcess
 if ($count -gt 0) {
-  Write-Host "[stop] stopped $count process(es) on $($script:AppUrl)"
+  Write-Host "[stop] stopped $count process(es) including hidden worker on $($script:AppUrl)"
 } else {
   Write-Host "[stop] no matching app process found on $($script:AppUrl)"
 }

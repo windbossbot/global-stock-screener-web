@@ -2608,16 +2608,43 @@ def prefilter_universe_fast(
     if universe.empty:
         return universe
 
-    def should_enforce_strict(match_count: int, known_count: int, current_size: int) -> bool:
+    def should_enforce_strict(match_count: int, known_count: int, current_size: int, market_label: str = "") -> bool:
         if not strict_metadata_prefilter:
             return False
         if match_count <= 0 or known_count <= 0 or current_size <= 0:
             return False
-        if match_count >= 12:
+        coverage = known_count / max(1, current_size)
+        market_norm = str(market_label).strip().upper()
+        if market_norm == "US" and coverage < 0.18:
+            return False
+        if coverage >= 0.55 and match_count >= 3:
             return True
-        if match_count >= 5 and (known_count / max(1, current_size)) >= 0.25:
+        if match_count >= 12 and coverage >= 0.08:
+            return True
+        if match_count >= 5 and coverage >= 0.25:
+            return True
+        if market_norm == "KR" and match_count >= 20:
             return True
         return False
+
+    def build_market_keep_mask(frame: pd.DataFrame, known_mask: pd.Series, match_mask: pd.Series) -> pd.Series:
+        if frame.empty:
+            return pd.Series(dtype=bool)
+        keep_mask = pd.Series(False, index=frame.index, dtype=bool)
+        if "market" not in frame.columns:
+            if should_enforce_strict(int(match_mask.sum()), int(known_mask.sum()), len(frame)):
+                return match_mask.astype(bool)
+            return ((~known_mask) | match_mask).astype(bool)
+        market_series = frame["market"].fillna("").astype(str).str.upper()
+        for market_label in market_series.unique():
+            market_idx = market_series.eq(market_label)
+            market_known = known_mask.loc[market_idx]
+            market_match = match_mask.loc[market_idx]
+            if should_enforce_strict(int(market_match.sum()), int(market_known.sum()), int(market_idx.sum()), market_label):
+                keep_mask.loc[market_idx] = market_match.astype(bool)
+            else:
+                keep_mask.loc[market_idx] = ((~market_known) | market_match).astype(bool)
+        return keep_mask
 
     out = universe.copy()
     etf_mode_norm = normalize_etf_mode(etf_mode)
@@ -2636,18 +2663,12 @@ def prefilter_universe_fast(
     if dividend_only and "is_dividend" in out.columns:
         known_div = out["is_dividend"].notna()
         div_true = _truthy_flag_series(out, "is_dividend")
-        if should_enforce_strict(int(div_true.sum()), int(known_div.sum()), len(out)):
-            out = out[div_true]
-        else:
-            out = out[~known_div | div_true]
+        out = out[build_market_keep_mask(out, known_div, div_true)]
     if selected_cycles and "dividend_cycle" in out.columns:
         cycle = out["dividend_cycle"].fillna("").astype(str).str.strip()
         known_cycle = cycle.ne("")
         cycle_match = cycle.isin(selected_cycles)
-        if should_enforce_strict(int(cycle_match.sum()), int(known_cycle.sum()), len(out)):
-            out = out[cycle_match]
-        else:
-            out = out[~known_cycle | cycle_match]
+        out = out[build_market_keep_mask(out, known_cycle, cycle_match)]
     return out
 
 
@@ -2664,6 +2685,9 @@ def prioritize_scan_candidates(universe: pd.DataFrame, ctx: Dict[str, object]) -
     if "is_dividend" in out.columns:
         dividend_flag = _truthy_flag_series(out, "is_dividend")
     cycle = out.get("dividend_cycle", pd.Series("", index=out.index)).fillna("").astype(str).str.strip()
+    market_series = out.get("market", pd.Series("", index=out.index)).fillna("").astype(str).str.upper()
+    us_like = market_series.eq("US")
+    income_name_hint = name_series.str.contains(r"DIVIDEND|INCOME|YIELD|MONTHLY|REIT|TRUST|FUND|ETF", regex=True)
     selected_cycles = [str(x).strip() for x in ctx.get("dividend_cycles", []) if str(x).strip()]
     selected_conditions = [str(x).strip() for x in ctx.get("selected_conditions", []) if str(x).strip()]
     scan_priority = pd.Series(0.0, index=out.index, dtype=float)
@@ -2677,11 +2701,15 @@ def prioritize_scan_candidates(universe: pd.DataFrame, ctx: Dict[str, object]) -
     if bool(ctx.get("dividend_only", False)):
         scan_priority += dividend_flag.astype(float) * 6.0
         scan_priority += cycle.ne("").astype(float) * 3.0
+        scan_priority += (us_like & income_name_hint & cycle.eq("")).astype(float) * 1.4
 
     if selected_cycles:
         cycle_bonus_map = {"월배당": 4.0, "분기배당": 3.0, "반기배당": 2.0, "연배당": 1.0}
         scan_priority += cycle.isin(selected_cycles).astype(float) * 10.0
         scan_priority += cycle.map(cycle_bonus_map).fillna(0.0)
+        if "월배당" in selected_cycles:
+            monthly_hint = name_series.str.contains(r"MONTHLY|DIVIDEND|INCOME|YIELD|REIT", regex=True)
+            scan_priority += (us_like & cycle.eq("") & monthly_hint).astype(float) * 2.2
 
     if selected_conditions:
         if "강한 상승 구조 (5>20>60>120)" in selected_conditions:

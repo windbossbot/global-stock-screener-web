@@ -17,7 +17,7 @@ Updated: 2026-04-03
 6. `Yahoo` 재무/배당 조회는 HTTP 세션 재사용과 로컬 CSV 스냅샷 캐시를 함께 사용한다.
 7. 현재 운영 모드는 외부 무료 호스팅이 아니라 로컬 실행 전용이다.
 8. 사용자 수동 업로드 파일은 `user_uploads` 폴더로 모으고, 루트에 직접 두지 않는다.
-9. 현재 `US 월배당`은 유니버스 메타가 비어 있어 `통합 월배당` 검색에서 누락될 수 있다.
+9. 현재 `US 월배당`은 전용 메타 소스가 약해 탐색 효율이 `KR`보다 낮지만, 시장별 사전필터 조정으로 미국 종목이 초기에 통째로 제거되지는 않도록 맞췄다.
 
 ## 3. Main Paths
 
@@ -46,6 +46,7 @@ Updated: 2026-04-03
    - `C:\Users\KGWPC\workspace\dividend-screener-v3\requirements.txt`
    - `C:\Users\KGWPC\workspace\dividend-screener-v3\.streamlit\config.toml`
    - `C:\Users\KGWPC\workspace\dividend-screener-v3\web_local_common.ps1`
+   - `C:\Users\KGWPC\workspace\dividend-screener-v3\web_local_worker.ps1`
    - `C:\Users\KGWPC\workspace\dividend-screener-v3\run_web.ps1`
    - `C:\Users\KGWPC\workspace\dividend-screener-v3\run_web_keepalive.ps1`
    - `C:\Users\KGWPC\workspace\dividend-screener-v3\stop_web.ps1`

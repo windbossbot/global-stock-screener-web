@@ -9,7 +9,7 @@ Updated: 2026-04-03
 - 루트 문서는 `README.md` 중심으로 정리했고, 오래된 복구/범위/배포 문서는 제거했다.
 - 앱 코드는 Google 제거, CSV 저장, 재무 필터, 우선순위 정렬, HTTP 세션 재사용, 로컬 스냅샷 캐시 기준으로 갱신했다.
 - 운영 기준은 외부 무료 호스팅이 아니라 로컬 실행으로 확정했다.
-- 로컬 실행 스크립트는 `run_web.ps1`, `run_web_keepalive.ps1`, `stop_web.ps1` 기준으로 정리했다.
+- 로컬 실행 스크립트는 숨김 background worker 기반의 `run_web.ps1`, `run_web_keepalive.ps1`, `stop_web.ps1` 기준으로 정리했다.
 - 사용자 업로드 CSV는 루트가 아니라 `user_uploads` 아래로 옮겨 관리한다.
 
 ## 2. What The Next Session Should Read First
@@ -27,7 +27,7 @@ Updated: 2026-04-03
 3. Google Sheets 관련 코드는 제거되었고, 결과는 CSV로 저장된다.
 4. 재무/배당 스냅샷은 `_cache` 아래 로컬 CSV 캐시를 우선 사용한다.
 5. Git 메타데이터는 이 폴더 기준 하나로 복구/통일하는 방향이 맞다.
-6. `US 월배당` 검색은 현재 메타 소스 부재로 누락될 수 있다.
+6. `US 월배당` 검색은 전용 메타 소스가 약해 탐색 효율이 낮지만, 현재는 시장별 선필터 조정으로 미국 종목이 초기에 통째로 탈락하지 않도록 수정했다.
 
 ## 4. Non-Destructive Connection Direction
 
