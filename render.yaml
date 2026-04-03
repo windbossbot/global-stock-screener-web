@@ -3,6 +3,6 @@ services:
     name: global-stock-screener
     env: python
     plan: free
-    rootDir: global_stock_screener_web
+    rootDir: .
     buildCommand: pip install -r requirements.txt
     startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.fileWatcherType none --runner.fastReruns true

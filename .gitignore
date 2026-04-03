@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+.playwright-cli/
+_cache/
+.myclaw/backups/
+.myclaw/output/
+.myclaw/runs/
+.myclaw/smoke/
+*.pyc

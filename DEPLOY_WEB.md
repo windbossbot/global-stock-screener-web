@@ -3,7 +3,7 @@
 ## Render (Recommended for always-on)
 1. Push this project to GitHub.
 2. In Render, create a new Blueprint and connect the repo.
-3. Render will read `global_stock_screener_web/render.yaml`.
+3. Render will read `render.yaml`.
 4. Deploy and open the generated URL.
 
 Notes:
@@ -12,7 +12,7 @@ Notes:
 
 ## Streamlit Community Cloud
 1. Connect GitHub repo.
-2. Set app file path to `global_stock_screener_web/app.py`.
+2. Set app file path to `app.py`.
 3. Deploy.
 
 Notes:
@@ -23,6 +23,7 @@ Notes:
 - Python dependencies are in `requirements.txt`.
 - Streamlit config is in `.streamlit/config.toml`.
 - Optional KRX key is entered in-app (sidebar).
+- Render speed options are already enabled in both `render.yaml` and `.streamlit/config.toml`.
 
 ## Troubleshooting
 - If app shows no KR symbols:
@@ -31,3 +32,4 @@ Notes:
 - If scan is too slow:
   - Use `시장 모드: 국장(KR)` or limit `최대 스캔 수`.
   - Keep `조회 기간` at `2y` unless long MA filters are required.
+  - Keep `고속 모드` ON when running in Render free tier.

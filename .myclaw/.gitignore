@@ -1,0 +1,10 @@
+runs/
+smoke/
+output/
+backups/
+state/current_workline_report.md
+state/current_workline_report.json
+state/internal_session_registry.json
+state/loop_control.json
+state/loop_status.json
+state/session_stack_state.json

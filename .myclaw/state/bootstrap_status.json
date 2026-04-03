@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-04-03T12:20:52+09:00",
+  "bootstrap_complete": true,
+  "default_local_save_complete": true,
+  "direction_questions_path": "C:\\Users\\KGWPC\\workspace\\dividend-screener-v3\\.myclaw\\docs\\BOOTSTRAP_DIRECTION_QUESTIONS_CURRENT.md",
+  "direction_state_path": "C:\\Users\\KGWPC\\workspace\\dividend-screener-v3\\.myclaw\\state\\bootstrap_direction_state.json",
+  "next_step": "ask_user_direction_questions",
+  "status": "ready-for-direction"
+}
