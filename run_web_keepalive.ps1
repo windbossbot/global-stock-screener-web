@@ -18,7 +18,7 @@ if (-not (Test-Path $py)) {
 while ($true) {
   Write-Host "[keepalive] streamlit starting..."
   try {
-    & $py -m streamlit run app.py --server.headless true --server.address 0.0.0.0 --server.port 8502
+    & $py -m streamlit run app.py --server.headless true --server.address 127.0.0.1 --server.port 8501 --server.fileWatcherType none --runner.fastReruns true
   } catch {
     Write-Host "[keepalive] streamlit crashed: $($_.Exception.Message)"
   }

@@ -14,4 +14,4 @@ if (-not (Test-Path $py)) {
 
 & $py -m pip install --upgrade pip
 & $py -m pip install -r requirements.txt
-& $py -m streamlit run app.py
+& $py -m streamlit run app.py --server.headless true --server.address 127.0.0.1 --server.port 8501 --server.fileWatcherType none --runner.fastReruns true

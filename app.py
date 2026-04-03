@@ -3308,7 +3308,7 @@ def main() -> None:
         }
         if len(fast_universe) > 1500 and run_workers > 6:
             run_workers = 6
-            st.info("대규모 스캔에서 Render 응답성과 429 완화를 위해 병렬 스레드를 6으로 자동 조정했습니다.")
+            st.info("대규모 스캔에서 응답성과 429 완화를 위해 병렬 스레드를 6으로 자동 조정했습니다.")
         raw, scan_stats = run_scan(
             fast_universe,
             fx,
@@ -3533,9 +3533,9 @@ def main() -> None:
                 "20일평균거래대금(억원)표시": "20일평균거래대금(억원)",
                 "listing_days": "상장일수",
             }
-            render_df = view[safe_cols].rename(columns=rename_map)
+            view_df = view[safe_cols].rename(columns=rename_map)
             st.dataframe(
-                render_df,
+                view_df,
                 use_container_width=True,
                 height=650,
                 column_config={

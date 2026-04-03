@@ -6,8 +6,9 @@ Updated: 2026-04-03
 
 - `2026-04-03` 에 공유 스크립트 `C:\Users\KGWPC\workspace\myclaw\scripts\bootstrap_myclaw_nest.py` 로 프로젝트 로컬 `.myclaw` nest 를 생성했다.
 - 루트 `AGENTS.md` 가 이제 `.myclaw` 기반 current truth 읽기 순서를 가리킨다.
-- 루트 문서는 `README.md`, `DEPLOY_WEB.md` 중심으로 정리했고, 오래된 복구/범위 문서는 제거했다.
+- 루트 문서는 `README.md` 중심으로 정리했고, 오래된 복구/범위/배포 문서는 제거했다.
 - 앱 코드는 Google 제거, CSV 저장, 재무 필터, 우선순위 정렬, HTTP 세션 재사용, 로컬 스냅샷 캐시 기준으로 갱신했다.
+- 운영 기준은 외부 무료 호스팅이 아니라 로컬 실행으로 확정했다.
 
 ## 2. What The Next Session Should Read First
 
@@ -34,6 +35,5 @@ Updated: 2026-04-03
 
 ## 5. Biggest Remaining Risk
 
-1. Render free tier 특성상 cold start 는 남는다.
-2. 캐시/가상환경 잔재는 커밋 대상에서 계속 제외해야 한다.
-3. Render 쪽 실제 서비스 루트가 repo root 기준으로 다시 읽히는지 배포 후 확인이 필요하다.
+1. 캐시/가상환경 잔재는 커밋 대상에서 계속 제외해야 한다.
+2. 장시간 스캔 중 외부 데이터 소스 응답 저하나 429는 계속 대비해야 한다.

@@ -9,7 +9,7 @@
 - 공유 엔진 `C:\Users\KGWPC\workspace\myclaw` 는 admin-only 유지보수 표면입니다. 일반 프로젝트 작업에서는 기본 참조/쓰기 루트로 쓰지 않습니다.
 - 공유 엔진은 재사용 script/template/helper 가 실제로 필요할 때만 제한적으로 호출합니다.
 - 엔진 자체를 바꾸는 작업이 아니라면 `C:\Users\KGWPC\workspace\myclaw` 아래 파일을 수정하지 않습니다.
-- 루트의 참고 문서는 기본적으로 `README.md`, `DEPLOY_WEB.md` 만 유지합니다. 그 외 오래된 복구/범위 문서는 필요 시 백업에서만 참고합니다.
+- 루트의 참고 문서는 기본적으로 `README.md` 만 유지합니다. 그 외 오래된 복구/범위/배포 문서는 필요 시 정리하거나 삭제합니다.
 - Git 기준은 이 폴더의 정상 `.git` 디렉터리 하나로 통일합니다. worktree 잔재나 다른 복제본을 현재 truth 로 쓰지 않습니다.
 - context engineering 기본 규칙은 `write / select / compress / isolate` 이고, 현재 단계에 꼭 필요한 최소 context package만 유지합니다.
 - 스킬, 스크립트, 에이전트, 자동화, 템플릿 등을 실제로 사용했을 때는 가능하면 `[judge_request.py 스크립트]`, `[myclaw-admin-mode 스킬]`, `[worker 에이전트]` 같은 대괄호 태그로 짧게 표시합니다.

@@ -15,6 +15,7 @@ Updated: 2026-04-03
 4. 결과 저장은 `_cache/exports/latest_screener.csv` 와 타임스탬프 CSV를 기준으로 한다.
 5. Git 기준은 이 폴더의 정상 `.git` 디렉터리 하나이며, 캐시/가상환경은 추적 대상이 아니다.
 6. `Yahoo` 재무/배당 조회는 HTTP 세션 재사용과 로컬 CSV 스냅샷 캐시를 함께 사용한다.
+7. 현재 운영 모드는 외부 무료 호스팅이 아니라 로컬 실행 전용이다.
 
 ## 3. Main Paths
 
@@ -39,13 +40,11 @@ Updated: 2026-04-03
 
 1. runtime app:
    - `C:\Users\KGWPC\workspace\dividend-screener-v3\app.py`
-2. deployment/runtime config:
+2. runtime config:
    - `C:\Users\KGWPC\workspace\dividend-screener-v3\requirements.txt`
-   - `C:\Users\KGWPC\workspace\dividend-screener-v3\render.yaml`
    - `C:\Users\KGWPC\workspace\dividend-screener-v3\.streamlit\config.toml`
 3. existing root reference docs:
    - `C:\Users\KGWPC\workspace\dividend-screener-v3\README.md`
-   - `C:\Users\KGWPC\workspace\dividend-screener-v3\DEPLOY_WEB.md`
 
 ## 5. Docs Ownership
 

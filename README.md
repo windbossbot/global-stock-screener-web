@@ -1,8 +1,8 @@
 > 세션/운영 current truth 시작점은 `C:\Users\KGWPC\workspace\dividend-screener-v3\.myclaw\docs\START_HERE_CURRENT.md` 입니다.
 
-# Global Stock Screener (Web)
+# Global Stock Screener (Local)
 
-KR/US 주식 스크리너 웹 앱입니다. 로컬 실행과 웹 공유(Render/Streamlit Cloud) 모두 지원합니다.
+KR/US 주식 스크리너 로컬 앱입니다. 현재 운영 기준은 `로컬 실행 전용`입니다.
 
 ## 핵심 기능
 - 시장 모드: `국장(KR) / 미장(US) / 통합(KR+US)`
@@ -23,16 +23,13 @@ powershell -ExecutionPolicy Bypass -File .\run_web.ps1
 powershell -ExecutionPolicy Bypass -File .\run_web_keepalive.ps1
 ```
 
-## 웹 공유 (무료)
-### 1) Render
-- 이 폴더에는 `render.yaml`이 포함되어 있습니다.
-- Render에서 GitHub repo 연결 후 Blueprint 배포하면 됩니다.
-- 시작 명령: `streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.fileWatcherType none --runner.fastReruns true`
+기본 접속 주소:
+- `http://127.0.0.1:8501`
 
-### 2) Streamlit Community Cloud
-1. GitHub repo 연결
-2. 앱 경로를 `app.py`로 지정
-3. 배포
+## 운영 기준
+- 외부 무료 호스팅은 cold start, 휘발성 파일시스템(ephemeral filesystem), 장시간 조건검색 시 자원 제약 때문에 현재 프로젝트 기준으로 사용하지 않습니다.
+- 결과 저장은 `_cache/exports/latest_screener.csv` 와 타임스탬프 CSV 기준입니다.
+- `KRX Open API` 키는 `_cache/krx_api_key.txt` 또는 앱 사이드바 설정에서 관리합니다.
 
 ## KRX Open API (선택)
 - 앱 사이드바 `KRX Open API 설정`에서 키 저장/테스트 가능
@@ -42,5 +39,5 @@ powershell -ExecutionPolicy Bypass -File .\run_web_keepalive.ps1
 ## 주의
 - 무료 데이터 소스 특성상 응답 지연/차단이 발생할 수 있습니다.
 - KRX 실데이터 소스가 실패하면 fallback 목록으로 동작할 수 있습니다.
-- Google Sheets 업로드는 제거했고, 결과는 `_cache/exports/latest_screener.csv` 와 타임스탬프 CSV로 저장됩니다.
+- Google Sheets 업로드는 제거했습니다.
 - 투자 판단은 본인 책임입니다.
